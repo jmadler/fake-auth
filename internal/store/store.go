@@ -14,6 +14,19 @@ type User struct {
 	Role           string
 }
 
+type Role struct {
+	ID          string
+	Name        string
+	Description string
+}
+
+type Permission struct {
+	ID                        string
+	Name                      string
+	ResourceServerIdentifier  string
+	Description               string
+}
+
 type UserStore interface {
 	GetByEmail(ctx context.Context, email string) (*User, error)
 	GetByID(ctx context.Context, id string) (*User, error)
