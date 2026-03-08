@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"os"
@@ -57,20 +58,27 @@ func main() {
 	sessionStore := sessions.NewStore(7 * 24 * time.Hour) // 7 days
 	rulesRunner := rules.NewRunner(rulesDir)
 	clientRegistry := clients.NewRegistry()
+	var extraAccessTokenClaims map[string]interface{}
+	if v := os.Getenv("ACCESS_TOKEN_EXTRA_CLAIMS"); v != "" {
+		if err := json.Unmarshal([]byte(v), &extraAccessTokenClaims); err != nil {
+			log.Printf("warning: invalid ACCESS_TOKEN_EXTRA_CLAIMS JSON: %v", err)
+		}
+	}
 	if err := clientRegistry.LoadFromEnv(); err != nil {
 		log.Printf("warning: CLIENT_REGISTRY: %v", err)
 	}
 
 	h := &handlers.Handlers{
-		Store:               st,
-		Issuer:              issuer,
-		IssuerURL:           issuerURL,
-		GrantStore:          grantStore,
-		SessionStore:        sessionStore,
-		RulesRunner:         rulesRunner,
-		ClientRegistry:      clientRegistry,
-		AccessTokenLifetime: parseIntEnv("ACCESS_TOKEN_LIFETIME", 86400),
-		IDTokenLifetime:     parseIntEnv("ID_TOKEN_LIFETIME", 86400),
+		Store:                  st,
+		Issuer:                 issuer,
+		IssuerURL:              issuerURL,
+		GrantStore:             grantStore,
+		SessionStore:           sessionStore,
+		RulesRunner:            rulesRunner,
+		ClientRegistry:         clientRegistry,
+		AccessTokenLifetime:    parseIntEnv("ACCESS_TOKEN_LIFETIME", 86400),
+		IDTokenLifetime:        parseIntEnv("ID_TOKEN_LIFETIME", 86400),
+		ExtraAccessTokenClaims: extraAccessTokenClaims,
 	}
 
 	addr := ":" + port

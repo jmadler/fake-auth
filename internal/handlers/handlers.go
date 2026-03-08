@@ -27,15 +27,16 @@ const sessionCookieName = "fake_auth_session"
 const sessionCookieMaxAge = 86400 * 7 // 7 days
 
 type Handlers struct {
-	Store               *store.SQLiteStore
-	Issuer              *token.Issuer
-	IssuerURL           string
-	GrantStore          *grants.Store
-	RulesRunner         *rules.Runner
-	ClientRegistry      *clients.Registry // nil = no client validation
-	SessionStore        *sessions.Store   // nil = no server-side sessions
-	AccessTokenLifetime int               // seconds, 0 = default 86400
-	IDTokenLifetime     int               // seconds, 0 = default 86400
+	Store                 *store.SQLiteStore
+	Issuer                *token.Issuer
+	IssuerURL             string
+	GrantStore            *grants.Store
+	RulesRunner           *rules.Runner
+	ClientRegistry        *clients.Registry // nil = no client validation
+	SessionStore          *sessions.Store   // nil = no server-side sessions
+	AccessTokenLifetime   int              // seconds, 0 = default 86400
+	IDTokenLifetime       int              // seconds, 0 = default 86400
+	ExtraAccessTokenClaims map[string]interface{} // optional; merged into all user access tokens (e.g. from ACCESS_TOKEN_EXTRA_CLAIMS env)
 }
 
 func (h *Handlers) accessTokenLifetime() int {
@@ -256,7 +257,8 @@ func (h *Handlers) handlePasswordGrant(w http.ResponseWriter, r *http.Request, u
 	accessLifetime := h.accessTokenLifetime()
 	idLifetime := h.idTokenLifetime()
 	sessionID := "sid_" + uuid.New().String()
-	accessTok, err := h.Issuer.Issue(u.ID, aud, clientID, accessLifetime, ruleUser.AccessTokenClaims)
+	claims := mergeClaims(ruleUser.AccessTokenClaims, h.ExtraAccessTokenClaims)
+	accessTok, err := h.Issuer.Issue(u.ID, aud, clientID, accessLifetime, claims)
 	if err != nil {
 		metrics.TokenRequests.WithLabelValues("password", "error").Inc()
 		sendJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
@@ -302,6 +304,19 @@ func (h *Handlers) handleClientCredentials(w http.ResponseWriter, r *http.Reques
 		"token_type":   "Bearer",
 		"expires_in":   accessLifetime,
 	})
+}
+
+// mergeClaims merges custom into base; custom overrides base for duplicate keys.
+// nil base is treated as empty.
+func mergeClaims(base, custom map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{})
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range custom {
+		out[k] = v
+	}
+	return out
 }
 
 func (h *Handlers) handleAuthorizationCode(w http.ResponseWriter, r *http.Request, code, redirectURI, clientID, clientSecret, codeVerifier string) {
@@ -373,7 +388,8 @@ func (h *Handlers) handleAuthorizationCode(w http.ResponseWriter, r *http.Reques
 	if sessionID == "" {
 		sessionID = "sid_" + uuid.New().String()
 	}
-	accessTok, err := h.Issuer.Issue(u.ID, aud, effectiveClientID, accessLifetime, ruleUser.AccessTokenClaims)
+	claims := mergeClaims(ruleUser.AccessTokenClaims, h.ExtraAccessTokenClaims)
+	accessTok, err := h.Issuer.Issue(u.ID, aud, effectiveClientID, accessLifetime, claims)
 	if err != nil {
 		sendJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
 		return
@@ -435,7 +451,8 @@ func (h *Handlers) handleRefreshToken(w http.ResponseWriter, r *http.Request, re
 	if sessionID == "" {
 		sessionID = "sid_" + uuid.New().String()
 	}
-	accessTok, err := h.Issuer.Issue(rg.UserID, aud, rg.ClientID, accessLifetime, nil)
+	claims := mergeClaims(nil, h.ExtraAccessTokenClaims)
+	accessTok, err := h.Issuer.Issue(rg.UserID, aud, rg.ClientID, accessLifetime, claims)
 	if err != nil {
 		sendJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
 		return
@@ -665,7 +682,8 @@ func (h *Handlers) handleDeviceCodeToken(w http.ResponseWriter, r *http.Request,
 	accessLifetime := h.accessTokenLifetime()
 	idLifetime := h.idTokenLifetime()
 	sessionID := "sid_" + uuid.New().String()
-	accessTok, err := h.Issuer.Issue(grant.UserID, aud, grant.ClientID, accessLifetime, ruleUser.AccessTokenClaims)
+	claims := mergeClaims(ruleUser.AccessTokenClaims, h.ExtraAccessTokenClaims)
+	accessTok, err := h.Issuer.Issue(grant.UserID, aud, grant.ClientID, accessLifetime, claims)
 	if err != nil {
 		sendJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
 		return
@@ -733,7 +751,8 @@ func (h *Handlers) handleImplicitAuthorize(w http.ResponseWriter, r *http.Reques
 	idLifetime := h.idTokenLifetime()
 	var frag []string
 	if wantToken {
-		accessTok, err := h.Issuer.Issue(u.ID, aud, clientID, accessLifetime, ruleUser.AccessTokenClaims)
+		claims := mergeClaims(ruleUser.AccessTokenClaims, h.ExtraAccessTokenClaims)
+		accessTok, err := h.Issuer.Issue(u.ID, aud, clientID, accessLifetime, claims)
 		if err != nil {
 			sendJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
 			return
@@ -1012,7 +1031,8 @@ func (h *Handlers) handleLogin(w http.ResponseWriter, r *http.Request) {
 			idLifetime := h.idTokenLifetime()
 			var frag []string
 			if wantToken {
-				accessTok, err := h.Issuer.Issue(u.ID, aud, clientID, accessLifetime, ruleUser.AccessTokenClaims)
+				claims := mergeClaims(ruleUser.AccessTokenClaims, h.ExtraAccessTokenClaims)
+				accessTok, err := h.Issuer.Issue(u.ID, aud, clientID, accessLifetime, claims)
 				if err != nil {
 					http.Error(w, "server error", http.StatusInternalServerError)
 					return
