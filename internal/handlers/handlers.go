@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -25,6 +27,17 @@ import (
 
 const sessionCookieName = "fake_auth_session"
 const sessionCookieMaxAge = 86400 * 7 // 7 days
+const codeReplayTTL = 30 * time.Second // allow duplicate token exchange (e.g. React Strict Mode) to get same response
+
+type codeReplayEntry struct {
+	body   []byte
+	expires time.Time
+}
+
+var (
+	codeReplayMu    sync.Mutex
+	codeReplayCache = make(map[string]codeReplayEntry)
+)
 
 type Handlers struct {
 	Store                 *store.SQLiteStore
@@ -63,13 +76,30 @@ func (h *Handlers) issuerURL() string {
 func corsHeaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, DELETE, PATCH")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	// auth0-spa-js sends auth0-client (and similar) on token requests; allow them for browser E2E.
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, auth0-client")
 }
 
 func setRateLimitHeaders(w http.ResponseWriter) {
 	w.Header().Set("x-ratelimit-limit", "1000")
 	w.Header().Set("x-ratelimit-remaining", "999")
 	w.Header().Set("x-ratelimit-reset", "9999999999")
+}
+
+// normalizeURI returns a canonical form for URI comparison (trim trailing slash on path; root as no path).
+func normalizeURI(uri string) string {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return uri
+	}
+	if u.Path == "/" {
+		u.Path = ""
+	} else if u.Path != "" {
+		u.Path = strings.TrimSuffix(u.Path, "/")
+	}
+	u.RawQuery = ""
+	u.RawFragment = ""
+	return u.String()
 }
 
 func (h *Handlers) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -330,6 +360,16 @@ func (h *Handlers) handleAuthorizationCode(w http.ResponseWriter, r *http.Reques
 	}
 	ac, ok := h.GrantStore.ConsumeCode(code)
 	if !ok {
+		// Replay: return cached token response if this code was already exchanged (e.g. duplicate request from React Strict Mode)
+		codeReplayMu.Lock()
+		ent, has := codeReplayCache[code]
+		codeReplayMu.Unlock()
+		if has && time.Now().Before(ent.expires) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write(ent.body)
+			return
+		}
 		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant", "error_description": "Invalid or expired authorization code"})
 		return
 	}
@@ -337,7 +377,7 @@ func (h *Handlers) handleAuthorizationCode(w http.ResponseWriter, r *http.Reques
 		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant", "error_description": "Client ID mismatch"})
 		return
 	}
-	if redirectURI != "" && ac.RedirectURI != redirectURI {
+	if redirectURI != "" && normalizeURI(ac.RedirectURI) != normalizeURI(redirectURI) {
 		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant", "error_description": "Redirect URI mismatch"})
 		return
 	}
@@ -420,6 +460,18 @@ func (h *Handlers) handleAuthorizationCode(w http.ResponseWriter, r *http.Reques
 	}
 	metrics.TokenRequests.WithLabelValues("authorization_code", "success").Inc()
 	audit.LogToken("authorization_code", u.ID, effectiveClientID, true, nil)
+	// Cache response so duplicate token exchange (e.g. React Strict Mode) gets same tokens and avoids redirect loop
+	if body, err := json.Marshal(resp); err == nil {
+		codeReplayMu.Lock()
+		codeReplayCache[code] = codeReplayEntry{body: body, expires: time.Now().Add(codeReplayTTL)}
+		now := time.Now()
+		for k, e := range codeReplayCache {
+			if now.After(e.expires) {
+				delete(codeReplayCache, k)
+			}
+		}
+		codeReplayMu.Unlock()
+	}
 	sendJSON(w, http.StatusOK, resp)
 }
 
@@ -1227,6 +1279,7 @@ func (h *Handlers) handleCreateUserMgmt(w http.ResponseWriter, r *http.Request) 
 		Email       string                 `json:"email"`
 		Password    string                 `json:"password"`
 		Name        string                 `json:"name"`
+		UserID      string                 `json:"user_id"`
 		UserMetadata map[string]interface{} `json:"user_metadata"`
 		AppMetadata  map[string]interface{} `json:"app_metadata"`
 	}
@@ -1242,6 +1295,9 @@ func (h *Handlers) handleCreateUserMgmt(w http.ResponseWriter, r *http.Request) 
 		req.Password = "password123"
 	}
 	uid := "auth0|" + uuid.New().String()
+	if req.UserID != "" && (strings.HasPrefix(req.UserID, "auth0|") || strings.Contains(req.UserID, "|")) {
+		uid = req.UserID
+	}
 	displayName := req.Name
 	if displayName == "" {
 		displayName = req.Email
