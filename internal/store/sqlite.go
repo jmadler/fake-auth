@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	"golang.org/x/crypto/bcrypt"
@@ -103,7 +104,10 @@ func (s *SQLiteStore) migrate() error {
 	if err := s.seedRoles(); err != nil {
 		return err
 	}
-	return s.seedClientsAndConnections()
+	if err := s.seedClientsAndConnections(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *SQLiteStore) seedRoles() error {
@@ -126,6 +130,60 @@ func (s *SQLiteStore) seedClientsAndConnections() error {
 		INSERT OR IGNORE INTO connections (id, name, strategy) VALUES ('con_db_main', 'Username-Password-Authentication', 'auth0');
 	`)
 	return err
+}
+
+// SeedFromConfigFile loads users from a JSON config and inserts them (INSERT OR IGNORE). Idempotent.
+// Config format: {"users":[{"id":"auth0|...","email":"...","password":"...","display_name":"...","role":"vet"}]}
+func (s *SQLiteStore) SeedFromConfigFile(ctx context.Context, path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read seed config: %w", err)
+	}
+	var cfg struct {
+		Users []struct {
+			ID          string `json:"id"`
+			Email       string `json:"email"`
+			Password    string `json:"password"`
+			DisplayName string `json:"display_name"`
+			Role        string `json:"role"`
+		} `json:"users"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return fmt.Errorf("parse seed config: %w", err)
+	}
+	for _, u := range cfg.Users {
+		if u.ID == "" || u.Email == "" {
+			continue
+		}
+		pass := u.Password
+		if pass == "" {
+			pass = "password123"
+		}
+		hash, err := HashPassword(pass)
+		if err != nil {
+			return err
+		}
+		displayName := u.DisplayName
+		if displayName == "" {
+			displayName = u.Email
+		}
+		role := u.Role
+		if role == "" {
+			role = "user"
+		}
+		roleID := "rol_default"
+		if role == "admin" {
+			roleID = "rol_admin"
+		}
+		_, err = s.db.ExecContext(ctx,
+			`INSERT OR IGNORE INTO users (id, email, password_hash, display_name, organization_id, enterprise_id, role) VALUES (?, ?, ?, ?, 1, 1, ?)`,
+			u.ID, u.Email, hash, displayName, role)
+		if err != nil {
+			return err
+		}
+		_, _ = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO user_roles (user_id, role_id) VALUES (?, ?)`, u.ID, roleID)
+	}
+	return nil
 }
 
 func parseJSONMap(s sql.NullString) map[string]interface{} {

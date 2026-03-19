@@ -64,6 +64,7 @@ Auth0-compatible mock for local development. Stores users in SQLite and issues R
 - `PORT` — default 9092
 - `DB_PATH` — default `./data/auth0.db`
 - `ISSUER_URL` — JWT issuer (e.g. `http://fake-auth:9092`)
+- `SEED_USERS_PATH` — path to JSON config file to seed users at startup. Format: `{"users":[{"id":"auth0|...","email":"...","password":"...","display_name":"...","role":"..."}]}`. Idempotent (INSERT OR IGNORE).
 - `TLS_CERT`, `TLS_KEY` — enable HTTPS
 - `RULES_DIR` — directory with Auth0 Rules .js files (optional)
 - `CLIENT_REGISTRY` — JSON map of client_id → {client_secret, redirect_uris, allowed_scopes}. Example: `{"my-client":{"client_secret":"secret","redirect_uris":["http://localhost/cb"],"allowed_scopes":["openid","profile"]}}`
@@ -100,6 +101,6 @@ CI (GitHub Actions) builds and pushes on push to main. Add `DOCKERHUB_USERNAME` 
 ## Tests
 
 ```bash
-go test ./...                    # unit tests
-go test -tags=integration ./...   # unit + integration tests
+go test ./...                    # unit tests (handlers, store, etc.)
+go test -tags=integration ./...  # unit + integration tests (OAuth flows, SeedFromConfig)
 ```

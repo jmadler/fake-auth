@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -28,6 +29,42 @@ import (
 
 func setupIntegrationServer(t *testing.T) (baseURL string, cleanup func()) {
 	return setupIntegrationServerWithSession(t, false)
+}
+
+func setupIntegrationServerWithSeedConfig(t *testing.T, cfgPath string) (baseURL string, cleanup func()) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "auth0.db")
+	st, err := store.NewSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLite: %v", err)
+	}
+	if err := st.SeedFromConfigFile(context.Background(), cfgPath); err != nil {
+		t.Fatalf("SeedFromConfigFile: %v", err)
+	}
+	issuer, err := token.NewIssuer("http://localhost:0/")
+	if err != nil {
+		t.Fatalf("NewIssuer: %v", err)
+	}
+	grantStore := grants.NewStore(5*time.Minute, 24*time.Hour)
+	h := &handlers.Handlers{
+		Store:      st,
+		Issuer:     issuer,
+		IssuerURL:  "http://localhost:0",
+		GrantStore: grantStore,
+	}
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	srv := &http.Server{Handler: h}
+	go srv.Serve(listener)
+	time.Sleep(50 * time.Millisecond)
+	baseURL = "http://" + listener.Addr().String()
+	cleanup = func() {
+		srv.Shutdown(context.Background())
+		st.Close()
+	}
+	return baseURL, cleanup
 }
 
 func setupIntegrationServerWithSession(t *testing.T, useSession bool) (baseURL string, cleanup func()) {
@@ -511,6 +548,39 @@ func TestIntegrationManagementAPI(t *testing.T) {
 	delResp.Body.Close()
 	if delResp.StatusCode != 204 {
 		t.Errorf("DELETE /api/v2/users/{id}: %d", delResp.StatusCode)
+	}
+}
+
+func TestIntegrationSeedConfigUsers(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "users.json")
+	cfg := `{"users":[{"id":"auth0|config-vet","email":"config-vet@test.local","password":"password123","display_name":"Config Vet","role":"vet"}]}`
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	baseURL, cleanup := setupIntegrationServerWithSeedConfig(t, cfgPath)
+	defer cleanup()
+
+	form := url.Values{}
+	form.Set("grant_type", "password")
+	form.Set("username", "config-vet@test.local")
+	form.Set("password", "password123")
+	form.Set("client_id", "e2e-test")
+	resp, err := http.Post(baseURL+"/oauth/token", "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("token status %d: %s", resp.StatusCode, b)
+	}
+	var out map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if sub, _ := out["access_token"]; sub == nil || sub == "" {
+		t.Errorf("missing access_token: %v", out)
 	}
 }
 

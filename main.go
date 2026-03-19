@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -48,6 +49,14 @@ func main() {
 		log.Fatalf("store: %v", err)
 	}
 	defer st.Close()
+
+	if seedPath := os.Getenv("SEED_USERS_PATH"); seedPath != "" {
+		if err := st.SeedFromConfigFile(context.Background(), seedPath); err != nil {
+			log.Printf("warning: seed users from %s: %v", seedPath, err)
+		} else {
+			log.Printf("seeded users from %s", seedPath)
+		}
+	}
 
 	issuer, err := token.NewIssuer(issuerURL + "/")
 	if err != nil {
