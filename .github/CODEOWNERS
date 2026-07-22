@@ -1,0 +1,3 @@
+# fake-auth (Auth0-compatible mock) — Align with auth/integrations ownership; see https://github.com/Radimal/radimal-docs/blob/master/README.md#code-ownership (auth0 row: Oliver)
+
+* @jmadler
