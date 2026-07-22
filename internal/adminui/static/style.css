@@ -1,0 +1,96 @@
+/* auth2 Admin UI — minimal dark theme */
+:root {
+  --bg: #0f1117;
+  --bg2: #181c24;
+  --fg: #e6edf3;
+  --muted: #8b949e;
+  --border: #30363d;
+  --accent: #58a6ff;
+  --error: #f85149;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--fg); line-height: 1.5; }
+.admin { min-height: 100vh; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.admin-nav {
+  display: flex;
+  gap: 1rem;
+  padding: 1rem 1.5rem;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+}
+.admin-nav a { color: var(--fg); }
+.admin-nav a.logout { margin-left: auto; color: var(--muted); }
+
+main { padding: 1.5rem; max-width: 1200px; margin: 0 auto; }
+h1 { font-size: 1.5rem; margin: 0 0 0.5rem; }
+.muted { color: var(--muted); margin: 0 0 1.5rem; font-size: 0.9rem; }
+
+.dashboard-links { list-style: none; padding: 0; margin: 0; }
+.dashboard-links li { padding: 0.5rem 0; border-bottom: 1px solid var(--border); }
+.dashboard-links li:last-child { border-bottom: none; }
+
+/* Login */
+.login-card {
+  max-width: 360px;
+  margin: 4rem auto;
+  padding: 2rem;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.login-card h1 { margin-bottom: 0.5rem; }
+.login-card form { margin-top: 1.5rem; }
+.login-card label { display: block; margin-bottom: 0.25rem; font-size: 0.9rem; color: var(--muted); }
+.login-card input {
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  margin-bottom: 1rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  font-size: 1rem;
+}
+.login-card button {
+  width: 100%;
+  padding: 0.6rem 1rem;
+  background: var(--accent);
+  border: none;
+  border-radius: 4px;
+  color: var(--bg);
+  font-size: 1rem;
+  cursor: pointer;
+}
+.login-card button:hover { opacity: 0.9; }
+.error { color: var(--error); margin-top: 1rem; }
+
+/* Tables */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+.data-table th, .data-table td {
+  padding: 0.6rem 0.75rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.data-table th { background: var(--bg2); color: var(--muted); font-weight: 500; }
+.data-table td { color: var(--fg); }
+.data-table td.mono { font-family: ui-monospace, monospace; font-size: 0.85rem; max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+
+.pagination { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem; }
+.pagination button {
+  padding: 0.4rem 0.8rem;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  cursor: pointer;
+}
+.pagination button:hover:not(:disabled) { background: var(--border); }
+.pagination button:disabled { opacity: 0.5; cursor: not-allowed; }

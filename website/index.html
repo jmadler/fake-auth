@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>auth2 — Auth0 Alternative | Switch from Auth0 at Half the Price</title>
+  <meta name="description" content="auth2 is an Auth0 replacement you can self-host on GCP or AWS. Same OAuth, OIDC & Management API. Migrate from Auth0 easily — half the cost, full control.">
+  <meta name="keywords" content="Auth0 alternative, Auth0 replacement, switch from Auth0, Auth0 migration, Auth0 competitor, self-hosted Auth0, Auth0 pricing alternative">
+  <link rel="canonical" href="https://auth2.dev/">
+  <style>
+    :root {
+      --bg: #0a0e14;
+      --fg: #e6e6e6;
+      --accent: #00d9a5;
+      --muted: #6b7280;
+      --card: #141922;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--fg); line-height: 1.6; min-height: 100vh; }
+    .container { max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem; }
+    header { padding: 1.5rem 0; border-bottom: 1px solid rgba(255,255,255,.06); }
+    nav { display: flex; align-items: center; justify-content: space-between; gap: 2rem; flex-wrap: wrap; }
+    .logo { font-size: 1.5rem; font-weight: 700; color: var(--accent); }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    nav a { color: var(--muted); margin-left: 1.5rem; }
+    nav a:hover { color: var(--fg); }
+    .hero { padding: 4rem 0; text-align: center; }
+    .hero h1 { font-size: clamp(2rem, 5vw, 3rem); font-weight: 700; margin-bottom: 1rem; line-height: 1.2; }
+    .hero .tagline { font-size: 1.2rem; color: var(--muted); max-width: 600px; margin: 0 auto 2rem; }
+    .cta { display: inline-flex; gap: 1rem; margin-top: 1rem; flex-wrap: wrap; justify-content: center; }
+    .btn { display: inline-block; padding: .75rem 1.5rem; border-radius: 6px; font-weight: 600; transition: transform .15s; }
+    .btn-primary { background: var(--accent); color: var(--bg); border: none; }
+    .btn-primary:hover { transform: translateY(-2px); }
+    .btn-outline { border: 2px solid var(--accent); color: var(--accent); }
+    .features { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1.5rem; padding: 4rem 0; }
+    .feature { background: var(--card); padding: 1.5rem; border-radius: 8px; border: 1px solid rgba(255,255,255,.06); }
+    .feature h3 { color: var(--accent); margin-bottom: .5rem; font-size: 1.1rem; }
+    .pricing-bar { background: var(--card); padding: 3rem 2rem; border-radius: 12px; margin: 4rem 0; text-align: center; border: 1px solid rgba(0,217,165,.2); }
+    .pricing-bar h2 { margin-bottom: .5rem; font-size: 1.75rem; }
+    .pricing-bar p { color: var(--muted); }
+    .price { font-size: 2.5rem; color: var(--accent); font-weight: 700; margin: 1rem 0; }
+    footer { padding: 3rem 0; margin-top: 4rem; border-top: 1px solid rgba(255,255,255,.06); color: var(--muted); font-size: .9rem; text-align: center; }
+    .schema-compat { font-size: .85rem; color: var(--muted); margin-top: 2rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="container">
+      <nav>
+        <span class="logo">auth2</span>
+        <div>
+          <a href="#features">Features</a>
+          <a href="#pricing">Pricing</a>
+          <a href="migration.html">Switch from Auth0</a>
+          <a href="https://github.com/jmadler/auth2">GitHub</a>
+        </div>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="container">
+        <h1>The Auth0 alternative you can self-host</h1>
+        <p class="tagline">Same OAuth, OIDC & Management API. Migrate from Auth0 in hours — not weeks. Deploy on GCP or AWS at <strong>half the price</strong>.</p>
+        <div class="cta">
+          <a href="#pricing" class="btn btn-primary">See pricing</a>
+          <a href="migration.html" class="btn btn-outline">Switch from Auth0 →</a>
+        </div>
+      </div>
+    </section>
+
+    <section id="features">
+      <div class="container">
+        <h2 style="text-align:center;margin-bottom:2rem;font-size:1.5rem;">Why teams are switching from Auth0</h2>
+        <div class="features">
+          <div class="feature">
+            <h3>Drop-in replacement</h3>
+            <p>Auth0-compatible endpoints: <code>/authorize</code>, <code>/oauth/token</code>, <code>/.well-known/jwks.json</code>. Change the issuer URL and you're done.</p>
+          </div>
+          <div class="feature">
+            <h3>Half the cost</h3>
+            <p>Self-host on your infra. Pay for compute, not per-MAU. No surprise bills when you hit 25K users.</p>
+          </div>
+          <div class="feature">
+            <h3>Full control</h3>
+            <p>Your data stays in your Postgres and Redis. No vendor lock-in. Export anytime.</p>
+          </div>
+          <div class="feature">
+            <h3>Management API</h3>
+            <p>Users, clients, roles, connections — same Auth0-style APIs. Existing tooling works.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="pricing" class="pricing-bar">
+      <div class="container">
+        <h2>Auth0 pricing vs auth2</h2>
+        <p>Auth0 Essentials starts at $35/mo. Professional at $240/mo. With auth2, you pay for infrastructure only.</p>
+        <div class="price">~$17–120/mo total</div>
+        <p>Run on Cloud Run, ECS, or App Runner. No per-user fees. No tier limits.</p>
+        <div class="cta" style="margin-top:1.5rem;">
+          <a href="https://github.com/jmadler/auth2" class="btn btn-primary">Get started free</a>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="container">
+        <h2 style="text-align:center;margin-bottom:2rem;font-size:1.5rem;">Easy Auth0 migration</h2>
+        <ol style="max-width:560px;margin:0 auto;padding-left:1.5rem;color:var(--muted);">
+          <li style="margin-bottom:.75rem;">Deploy auth2 (Docker, GCP, or AWS)</li>
+          <li style="margin-bottom:.75rem;">Point <code>ISSUER_URL</code> to your auth2 instance</li>
+          <li style="margin-bottom:.75rem;">Export users from Auth0 (User Import/Export)</li>
+          <li style="margin-bottom:.75rem;">Import into auth2 via Management API</li>
+          <li>Update your app's auth config. Done.</li>
+        </ol>
+        <p style="text-align:center;margin-top:1.5rem;"><a href="migration.html">Full migration guide →</a></p>
+      </div>
+    </section>
+
+    <section class="schema-compat">
+      <div class="container">
+        <h2 style="font-size:1.1rem;margin-bottom:1rem;">What works today</h2>
+        <p>OAuth 2.0 / OIDC: authorization code, implicit, password, client_credentials, refresh token, device code. PKCE. JWKS. Token introspection. Management API (users, clients, roles, connections). Rules (JS). CORS, rate limiting, brute-force protection. PostgreSQL, Redis, health checks.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container">
+      <p>auth2 — Open source Auth0 alternative. Self-host. Own your auth.</p>
+      <p style="margin-top:.5rem;"><a href="https://github.com/jmadler/auth2">GitHub</a> · <a href="migration.html">Switch from Auth0</a></p>
+    </div>
+  </footer>
+</body>
+</html>

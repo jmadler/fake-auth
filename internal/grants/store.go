@@ -44,14 +44,25 @@ type DeviceCode struct {
 }
 
 type Store struct {
-	mu          sync.RWMutex
-	codes       map[string]*AuthCode
-	refresh     map[string]*RefreshGrant
-	devices     map[string]*DeviceCode    // device_code -> DeviceCode
-	userCodes   map[string]string         // user_code (uppercase) -> device_code
-	codeTTL     time.Duration
-	refreshTTL  time.Duration
-	deviceTTL   time.Duration
+	mu               sync.RWMutex
+	codes            map[string]*AuthCode
+	refresh          map[string]*RefreshGrant
+	devices          map[string]*DeviceCode   // device_code -> DeviceCode
+	userCodes        map[string]string        // user_code (uppercase) -> device_code
+	mfaPending       map[string]*MFAPending   // challenge_id -> MFAPending
+	socialState      map[string]*SocialState // state -> SocialState
+	webauthnSessions map[string]*webauthnSessionEntry
+	codeTTL          time.Duration
+	refreshTTL        time.Duration
+	deviceTTL        time.Duration
+	mfaTTL           time.Duration
+	socialStateTTL   time.Duration
+	webauthnTTL      time.Duration
+}
+
+type webauthnSessionEntry struct {
+	Data      []byte
+	ExpiresAt time.Time
 }
 
 // NewStore creates a grant store. Optional third arg is device code TTL for testing.
@@ -66,14 +77,26 @@ func NewStore(codeTTL, refreshTTL time.Duration, deviceTTL ...time.Duration) *St
 	if len(deviceTTL) > 0 && deviceTTL[0] > 0 {
 		dt = deviceTTL[0]
 	}
+	mfaTTL := 5 * time.Minute
+	if codeTTL > 0 {
+		mfaTTL = codeTTL
+	}
+	socialTTL := 10 * time.Minute
+	webauthnTTL := 5 * time.Minute
 	return &Store{
-		codes:      make(map[string]*AuthCode),
-		refresh:    make(map[string]*RefreshGrant),
-		devices:    make(map[string]*DeviceCode),
-		userCodes:  make(map[string]string),
-		codeTTL:    codeTTL,
-		refreshTTL: refreshTTL,
-		deviceTTL:  dt,
+		codes:            make(map[string]*AuthCode),
+		refresh:          make(map[string]*RefreshGrant),
+		devices:          make(map[string]*DeviceCode),
+		userCodes:        make(map[string]string),
+		mfaPending:       make(map[string]*MFAPending),
+		socialState:      make(map[string]*SocialState),
+		webauthnSessions: make(map[string]*webauthnSessionEntry),
+		codeTTL:          codeTTL,
+		refreshTTL:       refreshTTL,
+		deviceTTL:        dt,
+		mfaTTL:           mfaTTL,
+		socialStateTTL:   socialTTL,
+		webauthnTTL:      webauthnTTL,
 	}
 }
 
@@ -233,4 +256,120 @@ func (s *Store) cleanExpiredDevicesLocked() {
 			delete(s.userCodes, normalized)
 		}
 	}
+}
+
+func (s *Store) SaveMFAPending(challengeID string, pending *MFAPending) {
+	pending.ExpiresAt = time.Now().Add(s.mfaTTL)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanExpiredMFAPendingLocked()
+	s.mfaPending[challengeID] = pending
+}
+
+func (s *Store) GetMFAPending(challengeID string) (*MFAPending, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanExpiredMFAPendingLocked()
+	p, ok := s.mfaPending[challengeID]
+	if !ok || p == nil || time.Now().After(p.ExpiresAt) {
+		return nil, false
+	}
+	return p, true
+}
+
+func (s *Store) ConsumeMFAPending(challengeID string) (*MFAPending, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanExpiredMFAPendingLocked()
+	p, ok := s.mfaPending[challengeID]
+	if !ok || p == nil || time.Now().After(p.ExpiresAt) {
+		return nil, false
+	}
+	delete(s.mfaPending, challengeID)
+	return p, true
+}
+
+func (s *Store) cleanExpiredMFAPendingLocked() {
+	now := time.Now()
+	for k, v := range s.mfaPending {
+		if v != nil && now.After(v.ExpiresAt) {
+			delete(s.mfaPending, k)
+		}
+	}
+}
+
+func (s *Store) SaveSocialState(state string, data *SocialState) {
+	data.ExpiresAt = time.Now().Add(s.socialStateTTL)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanExpiredSocialStateLocked()
+	s.socialState[state] = data
+}
+
+func (s *Store) GetSocialState(state string) (*SocialState, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanExpiredSocialStateLocked()
+	ss, ok := s.socialState[state]
+	if !ok || ss == nil || time.Now().After(ss.ExpiresAt) {
+		return nil, false
+	}
+	return ss, true
+}
+
+func (s *Store) ConsumeSocialState(state string) (*SocialState, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanExpiredSocialStateLocked()
+	ss, ok := s.socialState[state]
+	if !ok || ss == nil || time.Now().After(ss.ExpiresAt) {
+		return nil, false
+	}
+	delete(s.socialState, state)
+	return ss, true
+}
+
+func (s *Store) cleanExpiredSocialStateLocked() {
+	now := time.Now()
+	for k, v := range s.socialState {
+		if v != nil && now.After(v.ExpiresAt) {
+			delete(s.socialState, k)
+		}
+	}
+}
+
+func (s *Store) SaveWebAuthnSession(sessionID string, data []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.webauthnSessions[sessionID] = &webauthnSessionEntry{
+		Data:      data,
+		ExpiresAt: time.Now().Add(s.webauthnTTL),
+	}
+}
+
+func (s *Store) GetWebAuthnSession(sessionID string) ([]byte, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.webauthnSessions[sessionID]
+	if !ok || e == nil || time.Now().After(e.ExpiresAt) {
+		if ok {
+			delete(s.webauthnSessions, sessionID)
+		}
+		return nil, false
+	}
+	return e.Data, true
+}
+
+func (s *Store) ConsumeWebAuthnSession(sessionID string) ([]byte, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.webauthnSessions[sessionID]
+	if !ok || e == nil || time.Now().After(e.ExpiresAt) {
+		if ok {
+			delete(s.webauthnSessions, sessionID)
+		}
+		return nil, false
+	}
+	delete(s.webauthnSessions, sessionID)
+	return e.Data, true
 }

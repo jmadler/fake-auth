@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Admin Login — auth2</title>
+  <link rel="stylesheet" href="/admin/style.css">
+</head>
+<body class="admin">
+  <main class="login-card">
+    <h1>auth2 Admin</h1>
+    <p class="muted">Enter your admin API key to continue.</p>
+    <form method="post" action="/admin/login">
+      <label for="key">Admin API Key</label>
+      <input type="password" id="key" name="key" autocomplete="current-password" required autofocus>
+      <button type="submit">Log in</button>
+    </form>
+    <p id="err" class="error" hidden></p>
+  </main>
+  <script>
+    const params = new URLSearchParams(location.search);
+    if (params.get('err') === 'invalid') {
+      document.getElementById('err').textContent = 'Invalid API key.';
+      document.getElementById('err').hidden = false;
+    }
+  </script>
+</body>
+</html>

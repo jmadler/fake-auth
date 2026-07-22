@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Clients — auth2 Admin</title>
+  <link rel="stylesheet" href="/admin/style.css">
+</head>
+<body class="admin">
+  <nav class="admin-nav">
+    <a href="/admin/">Dashboard</a>
+    <a href="/admin/users.html">Users</a>
+    <a href="/admin/clients.html">Clients</a>
+    <a href="/admin/roles.html">Roles</a>
+    <a href="/admin/logs.html">Logs</a>
+    <a href="/admin/logout" class="logout">Log out</a>
+  </nav>
+  <main>
+    <h1>Clients</h1>
+    <div id="loading">Loading...</div>
+    <div id="error" class="error" hidden></div>
+    <div id="content" hidden>
+      <table class="data-table">
+        <thead>
+          <tr><th>Client ID</th><th>Name</th><th>App Type</th><th>Callbacks</th><th>Origins</th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </main>
+  <script src="/admin/app.js"></script>
+  <script>
+    (function() {
+      function getAuth() { return { headers: adminAuth(); }; }
+      document.getElementById('loading').hidden = false;
+      fetch('/api/v2/clients', getAuth())
+        .then(r => { if (!r.ok) throw new Error(r.statusText); return r.json(); })
+        .then(data => {
+          const clients = Array.isArray(data) ? data : (data.clients || []);
+          const tbody = document.getElementById('rows');
+          tbody.innerHTML = clients.map(c => {
+            const id = escapeHtml(c.client_id || c.id || '');
+            const name = escapeHtml(c.name || '');
+            const appType = escapeHtml(c.app_type || '');
+            const callbacks = Array.isArray(c.callbacks) ? c.callbacks.join(', ') : '';
+            const origins = Array.isArray(c.allowed_origins) ? c.allowed_origins.join(', ') : '';
+            return `<tr><td>${id}</td><td>${name}</td><td>${appType}</td><td>${escapeHtml(callbacks)}</td><td>${escapeHtml(origins)}</td></tr>`;
+          }).join('');
+          document.getElementById('loading').hidden = true;
+          document.getElementById('content').hidden = false;
+        })
+        .catch(e => {
+          document.getElementById('loading').hidden = true;
+          document.getElementById('error').textContent = e.message || 'Failed to load clients';
+          document.getElementById('error').hidden = false;
+        });
+    })();
+  </script>
+</body>
+</html>

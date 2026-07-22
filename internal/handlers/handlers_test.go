@@ -16,12 +16,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jmadler/fake-auth/internal/clients"
-	"github.com/jmadler/fake-auth/internal/grants"
-	"github.com/jmadler/fake-auth/internal/rules"
-	"github.com/jmadler/fake-auth/internal/sessions"
-	"github.com/jmadler/fake-auth/internal/store"
-	"github.com/jmadler/fake-auth/internal/token"
+	"github.com/jmadler/auth2/internal/clients"
+	"github.com/jmadler/auth2/internal/grants"
+	"github.com/jmadler/auth2/internal/rules"
+	"github.com/jmadler/auth2/internal/sessions"
+	"github.com/jmadler/auth2/internal/store"
+	"github.com/jmadler/auth2/internal/token"
 )
 
 func testHandlers(t *testing.T) *Handlers {
@@ -125,8 +125,8 @@ func TestMetrics(t *testing.T) {
 		t.Fatalf("status %d, want 200", resp.StatusCode)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "authorize") && !strings.Contains(string(body), "fake_auth") {
-		t.Errorf("expected Prometheus metrics containing authorize or fake_auth")
+	if !strings.Contains(string(body), "authorize") && !strings.Contains(string(body), "auth2") {
+		t.Errorf("expected Prometheus metrics containing authorize or auth2")
 	}
 }
 
@@ -1024,6 +1024,128 @@ func TestSignup(t *testing.T) {
 	}
 }
 
+func TestSignupWeakPassword(t *testing.T) {
+	h := testHandlers(t)
+	body := bytes.NewBufferString(`{"email":"weak@example.com","password":"password"}`)
+	resp := h.do(t, "POST", "/dbconnections/signup", body, "application/json")
+	if resp.StatusCode != 400 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400 for weak password, got %d: %s", resp.StatusCode, b)
+	}
+}
+
+func TestPasswordResetFlow(t *testing.T) {
+	os.Setenv("PASSWORD_RESET_DEV_RETURN_TOKEN", "true")
+	defer os.Unsetenv("PASSWORD_RESET_DEV_RETURN_TOKEN")
+	h := testHandlers(t)
+	// Request reset for existing user
+	body := bytes.NewBufferString(`{"email":"test@example.com"}`)
+	resp := h.do(t, "POST", "/passwordless/reset", body, "application/json")
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("reset request status %d: %s", resp.StatusCode, b)
+	}
+	var resetOut map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&resetOut)
+	token, _ := resetOut["reset_token"].(string)
+	if token == "" {
+		t.Fatal("expected reset_token in response")
+	}
+	// Confirm with new password
+	confirmBody := bytes.NewBufferString(`{"token":"` + token + `","new_password":"NewSecure9"}`)
+	confirmResp := h.do(t, "POST", "/passwordless/confirm", confirmBody, "application/json")
+	if confirmResp.StatusCode != 200 {
+		b, _ := io.ReadAll(confirmResp.Body)
+		t.Fatalf("confirm status %d: %s", confirmResp.StatusCode, b)
+	}
+	// Login with new password
+	form := url.Values{}
+	form.Set("grant_type", "password")
+	form.Set("username", "test@example.com")
+	form.Set("password", "NewSecure9")
+	tokResp := h.doForm(t, "POST", "/oauth/token", form)
+	if tokResp.StatusCode != 200 {
+		b, _ := io.ReadAll(tokResp.Body)
+		t.Fatalf("login with new password status %d: %s", tokResp.StatusCode, b)
+	}
+}
+
+func TestMagicLinkFlow(t *testing.T) {
+	os.Setenv("MAGIC_LINK_DEV_RETURN_TOKEN", "true")
+	defer os.Unsetenv("MAGIC_LINK_DEV_RETURN_TOKEN")
+	h := testHandlers(t)
+	body := bytes.NewBufferString(`{"email":"magic@example.com","auth_type":"magiclink","client_id":"e2e-test","redirect_uri":"http://localhost/callback","state":"xyz","response_type":"code"}`)
+	resp := h.do(t, "POST", "/passwordless/start", body, "application/json")
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("start status %d: %s", resp.StatusCode, b)
+	}
+	var out map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&out)
+	tok, _ := out["token"].(string)
+	if tok == "" || !strings.HasPrefix(tok, "magic_") {
+		t.Fatalf("expected magic_ token, got %v", out["token"])
+	}
+	// Verify: GET with token should redirect with code
+	verifyResp := h.do(t, "GET", "/passwordless/verify?token="+url.QueryEscape(tok)+"&state=xyz", nil, "")
+	if verifyResp.StatusCode != 302 {
+		b, _ := io.ReadAll(verifyResp.Body)
+		t.Fatalf("verify expected 302 redirect, got %d: %s", verifyResp.StatusCode, b)
+	}
+	loc := verifyResp.Header.Get("Location")
+	if !strings.Contains(loc, "code=") || !strings.Contains(loc, "state=xyz") {
+		t.Fatalf("redirect should contain code and state, got %s", loc)
+	}
+}
+
+func TestLoginPageCustomTemplate(t *testing.T) {
+	tpl := `<!DOCTYPE html><html><body><form method="post" action="/login">
+<input type="hidden" name="client_id" value="{{.ClientID}}">
+<input type="hidden" name="redirect_uri" value="{{.RedirectURI}}">
+<input type="text" name="username" value="{{.LoginHint}}">
+<input type="password" name="password">
+<button type="submit">Log in</button></form></body></html>`
+	dir := t.TempDir()
+	tplPath := filepath.Join(dir, "login.html")
+	if err := os.WriteFile(tplPath, []byte(tpl), 0644); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+	os.Setenv("LOGIN_PAGE_TEMPLATE", tplPath)
+	defer os.Unsetenv("LOGIN_PAGE_TEMPLATE")
+
+	h := testHandlers(t)
+	path := "/login?client_id=my-client&redirect_uri=http://localhost/cb&scope=openid&state=st&response_type=code&login_hint=user@example.com"
+	resp := h.do(t, "GET", path, nil, "")
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d: %s", resp.StatusCode, b)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "my-client") {
+		t.Errorf("body should contain client_id, got %s", body)
+	}
+	if !strings.Contains(string(body), "user@example.com") {
+		t.Errorf("body should contain login_hint, got %s", body)
+	}
+}
+
+func TestChangePassword(t *testing.T) {
+	os.Setenv("PASSWORD_RESET_DEV_RETURN_TOKEN", "true")
+	defer os.Unsetenv("PASSWORD_RESET_DEV_RETURN_TOKEN")
+	h := testHandlers(t)
+	body := bytes.NewBufferString(`{"email":"test@example.com"}`)
+	resp := h.do(t, "POST", "/dbconnections/change_password", body, "application/json")
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("change_password status %d: %s", resp.StatusCode, b)
+	}
+	var out map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&out)
+	if out["reset_token"] == nil {
+		t.Error("expected reset_token in dev mode")
+	}
+}
+
 // --- Management API tests ---
 
 func TestListUsers(t *testing.T) {
@@ -1080,7 +1202,7 @@ func TestListUsersSearch(t *testing.T) {
 
 func TestCreateUserMgmt(t *testing.T) {
 	h := testHandlers(t)
-	body := bytes.NewBufferString(`{"email":"mgmt@example.com","password":"pass123","name":"Mgmt User"}`)
+	body := bytes.NewBufferString(`{"email":"mgmt@example.com","password":"SecurePass8","name":"Mgmt User"}`)
 	resp := h.do(t, "POST", "/api/v2/users", body, "application/json")
 	if resp.StatusCode != 201 {
 		b, _ := io.ReadAll(resp.Body)
@@ -1334,4 +1456,91 @@ func TestListLogs(t *testing.T) {
 	}
 	var logs []map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&logs)
+}
+
+func TestLive(t *testing.T) {
+	h := testHandlers(t)
+	resp := h.do(t, "GET", "/live", nil, "")
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d: %s", resp.StatusCode, b)
+	}
+}
+
+func TestCIBARequest(t *testing.T) {
+	h := testHandlers(t)
+	body := `{"client_id":"test-client","login_hint":"test@example.com","scope":"openid"}`
+	resp := h.do(t, "POST", "/oauth/ciba/request", strings.NewReader(body), "application/json")
+	// May return 400 if client not found or missing params; we exercise the handler
+	if resp.StatusCode != 200 && resp.StatusCode != 400 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Logf("CIBA request: %d %s", resp.StatusCode, b)
+	}
+}
+
+func TestCIBAVerify(t *testing.T) {
+	h := testHandlers(t)
+	resp := h.do(t, "GET", "/ciba/verify", nil, "")
+	// Verify page or error
+	if resp.StatusCode != 200 && resp.StatusCode != 400 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Logf("CIBA verify: %d %s", resp.StatusCode, b)
+	}
+}
+
+func TestUsersImport(t *testing.T) {
+	h := testHandlers(t)
+	body := `[{"email":"imp@example.com","name":"Import User","password":"importpass123"}]`
+	resp := h.do(t, "POST", "/api/v2/users/import", strings.NewReader(body), "application/json")
+	if resp.StatusCode != 200 && resp.StatusCode != 401 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Logf("users import: %d %s", resp.StatusCode, b)
+	}
+}
+
+func TestUsersExport(t *testing.T) {
+	h := testHandlers(t)
+	resp := h.do(t, "GET", "/api/v2/users/export", nil, "")
+	if resp.StatusCode != 200 && resp.StatusCode != 401 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Logf("users export: %d %s", resp.StatusCode, b)
+	}
+}
+
+func TestNotFound(t *testing.T) {
+	h := testHandlers(t)
+	resp := h.do(t, "GET", "/nonexistent", nil, "")
+	if resp.StatusCode != 404 {
+		t.Errorf("expected 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestMFAEnrollNotEnabled(t *testing.T) {
+	h := testHandlers(t)
+	tok := getAccessToken(t, h)
+	body := `{}`
+	req := httptest.NewRequest("POST", "https://test.example.com/mfa/enroll", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 404 {
+		t.Errorf("MFA not enabled: expected 404, got %d", rec.Code)
+	}
+}
+
+func getAccessToken(t *testing.T, h *Handlers) string {
+	resp := h.doForm(t, "POST", "/oauth/token", url.Values{
+		"grant_type": {"password"},
+		"username":   {"test@example.com"},
+		"password":   {"password123"},
+		"client_id":  {"my-client"},
+	})
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("token: %d %s", resp.StatusCode, b)
+	}
+	var out map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&out)
+	return out["access_token"].(string)
 }

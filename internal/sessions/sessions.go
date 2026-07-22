@@ -15,26 +15,39 @@ type Session struct {
 	ExpiresAt time.Time
 }
 
-// Store manages server-side sessions. In-memory with TTL; suitable for single-instance dev.
-type Store struct {
+// SessionCounter optionally exposes active session count for metrics.
+type SessionCounter interface {
+	Count() int
+}
+
+// Store manages server-side sessions.
+// Implementations may be in-memory (single-instance) or Redis (multi-instance).
+type Store interface {
+	Create(userID, email string) (string, error)
+	Get(sessionID string) (*Session, bool)
+	Revoke(sessionID string)
+}
+
+// MemoryStore implements Store in-memory. Suitable for single-instance dev.
+type MemoryStore struct {
 	mu       sync.RWMutex
 	sessions map[string]*Session
 	ttl      time.Duration
 }
 
-// NewStore creates a session store. Default TTL is 24 hours.
-func NewStore(ttl time.Duration) *Store {
+// NewStore creates an in-memory session store. Default TTL is 24 hours.
+func NewStore(ttl time.Duration) *MemoryStore {
 	if ttl <= 0 {
 		ttl = 24 * time.Hour
 	}
-	return &Store{
+	return &MemoryStore{
 		sessions: make(map[string]*Session),
 		ttl:      ttl,
 	}
 }
 
 // Create creates a new session for the user. Returns the session ID.
-func (s *Store) Create(userID, email string) (string, error) {
+func (s *MemoryStore) Create(userID, email string) (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
@@ -53,8 +66,8 @@ func (s *Store) Create(userID, email string) (string, error) {
 	return sid, nil
 }
 
-// Get returns the session if valid. Consumes (extends) the session.
-func (s *Store) Get(sessionID string) (*Session, bool) {
+// Get returns the session if valid. Extends TTL on access.
+func (s *MemoryStore) Get(sessionID string) (*Session, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cleanExpiredLocked()
@@ -65,19 +78,26 @@ func (s *Store) Get(sessionID string) (*Session, bool) {
 		}
 		return nil, false
 	}
-	// Extend TTL on access
 	sess.ExpiresAt = time.Now().Add(s.ttl)
 	return sess, true
 }
 
 // Revoke removes a session (e.g. on logout).
-func (s *Store) Revoke(sessionID string) {
+func (s *MemoryStore) Revoke(sessionID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.sessions, sessionID)
 }
 
-func (s *Store) cleanExpiredLocked() {
+// Count returns the number of active (non-expired) sessions.
+func (s *MemoryStore) Count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanExpiredLocked()
+	return len(s.sessions)
+}
+
+func (s *MemoryStore) cleanExpiredLocked() {
 	now := time.Now()
 	for k, v := range s.sessions {
 		if now.After(v.ExpiresAt) {

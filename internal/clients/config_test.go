@@ -2,6 +2,7 @@ package clients
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -57,5 +58,27 @@ func TestLoadFromEnv(t *testing.T) {
 	}
 	if !r.ValidateRedirectURI("env-client", "http://localhost:3000/cb") {
 		t.Error("env-client redirect_uri should work")
+	}
+}
+
+func TestLoadFromFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "clients.json")
+	json := `{"file-client":{"client_secret":"file-secret","redirect_uris":["https://app.example.com/cb"],"allowed_scopes":["openid","email"]}}`
+	if err := os.WriteFile(cfgPath, []byte(json), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	os.Setenv("CLIENT_REGISTRY_FILE", cfgPath)
+	defer os.Unsetenv("CLIENT_REGISTRY_FILE")
+
+	r := NewRegistry()
+	if err := r.LoadFromFile(); err != nil {
+		t.Fatalf("LoadFromFile: %v", err)
+	}
+	if !r.ValidateSecret("file-client", "file-secret") {
+		t.Error("file-client secret should work")
+	}
+	if !r.ValidateRedirectURI("file-client", "https://app.example.com/cb") {
+		t.Error("file-client redirect_uri should work")
 	}
 }

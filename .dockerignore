@@ -2,6 +2,6 @@
 .github
 data
 *.db
-fake-auth
+auth2
 .gitignore
 README.md

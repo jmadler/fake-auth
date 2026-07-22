@@ -1,0 +1,60 @@
+# Cloud Build for auth2 on Cloud Run
+# Run: gcloud builds submit --config=deploy/cloud-run/cloudbuild.yaml .
+#
+# Set substitutions before running:
+#   gcloud builds submit --config=deploy/cloud-run/cloudbuild.yaml . \
+#     --substitutions=_REGION=us-central1,_SERVICE_NAME=auth2
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - gcr.io/${PROJECT_ID}/auth2:${SHORT_SHA}
+      - -t
+      - gcr.io/${PROJECT_ID}/auth2:latest
+      - -f
+      - Dockerfile
+      - .
+
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - gcr.io/${PROJECT_ID}/auth2:${SHORT_SHA}
+
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - gcr.io/${PROJECT_ID}/auth2:latest
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - auth2
+      - --image
+      - gcr.io/${PROJECT_ID}/auth2:${SHORT_SHA}
+      - --region
+      - us-central1
+      - --platform
+      - managed
+      - --port
+      - "8080"
+      - --min-instances
+      - "0"
+      - --max-instances
+      - "10"
+      - --set-env-vars
+      - "PORT=8080"
+      - --update-secrets
+      - "DB_DSN=auth2-db-dsn:latest,REDIS_URL=auth2-redis-url:latest"
+      - --set-env-vars
+      - "ISSUER_URL=https://auth2.example.com"
+
+images:
+  - gcr.io/${PROJECT_ID}/auth2:${SHORT_SHA}
+  - gcr.io/${PROJECT_ID}/auth2:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY

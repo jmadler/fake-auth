@@ -14,16 +14,20 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/jmadler/fake-auth/internal/grants"
-	"github.com/jmadler/fake-auth/internal/handlers"
-	"github.com/jmadler/fake-auth/internal/sessions"
-	"github.com/jmadler/fake-auth/internal/store"
-	"github.com/jmadler/fake-auth/internal/token"
+	"github.com/jmadler/auth2/internal/acl"
+	"github.com/jmadler/auth2/internal/graphql"
+	"github.com/jmadler/auth2/internal/grants"
+	"github.com/jmadler/auth2/internal/handlers"
+	"github.com/jmadler/auth2/internal/scim"
+	"github.com/jmadler/auth2/internal/sessions"
+	"github.com/jmadler/auth2/internal/store"
+	"github.com/jmadler/auth2/internal/token"
 )
 
 func setupIntegrationServer(t *testing.T) (baseURL string, cleanup func()) {
@@ -62,11 +66,16 @@ func setupIntegrationServerWithSession(t *testing.T, useSession bool) (baseURL s
 	if useSession {
 		h.SessionStore = sessions.NewStore(7 * 24 * time.Hour)
 	}
+	issuerURL := "http://localhost:0"
+	scimHandler := scim.AuthMiddleware(scim.NewHandler(st, issuerURL))
+	mux := http.NewServeMux()
+	mux.Handle("/scim/v2/", http.StripPrefix("/scim/v2", scimHandler))
+	mux.Handle("/", h)
 	listener, err := net.Listen("tcp", ":0")
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	srv := &http.Server{Handler: h}
+	srv := &http.Server{Handler: mux}
 	go srv.Serve(listener)
 	time.Sleep(50 * time.Millisecond)
 	baseURL = "http://" + listener.Addr().String()
@@ -76,6 +85,53 @@ func setupIntegrationServerWithSession(t *testing.T, useSession bool) (baseURL s
 	}
 	return baseURL, cleanup
 }
+
+func setupIntegrationServerWithACL(t *testing.T, rules []acl.Rule) (baseURL string, cleanup func()) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "auth0.db")
+	st, err := store.NewSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLite: %v", err)
+	}
+	u := &store.User{
+		ID:             "auth0|int-user",
+		Email:          "integration@example.com",
+		DisplayName:    "Integration User",
+		OrganizationID: 1,
+		EnterpriseID:   1,
+		Role:           "user",
+	}
+	if err := st.CreateUser(context.Background(), u, "pass123"); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	issuer, err := token.NewIssuer("http://localhost:0/")
+	if err != nil {
+		t.Fatalf("NewIssuer: %v", err)
+	}
+	grantStore := grants.NewStore(5*time.Minute, 24*time.Hour)
+	h := &handlers.Handlers{
+		Store:      st,
+		Issuer:     issuer,
+		IssuerURL:  "http://localhost:0",
+		GrantStore: grantStore,
+	}
+	aclMiddleware := acl.Middleware(acl.New(rules))
+	handler := aclMiddleware(h)
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	srv := &http.Server{Handler: handler}
+	go srv.Serve(listener)
+	time.Sleep(50 * time.Millisecond)
+	baseURL = "http://" + listener.Addr().String()
+	cleanup = func() {
+		srv.Shutdown(context.Background())
+		st.Close()
+	}
+	return baseURL, cleanup
+}
+
 
 func TestIntegrationHealth(t *testing.T) {
 	baseURL, cleanup := setupIntegrationServer(t)
@@ -94,6 +150,203 @@ func TestIntegrationHealth(t *testing.T) {
 	}
 }
 
+func TestIntegrationLive(t *testing.T) {
+	baseURL, cleanup := setupIntegrationServer(t)
+	defer cleanup()
+	resp, err := http.Get(baseURL + "/live")
+	if err != nil {
+		t.Fatalf("GET /live: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("GET /live status %d, want 200", resp.StatusCode)
+	}
+	if !strings.Contains(string(body), "ok") {
+		t.Errorf("GET /live body %q does not contain 'ok'", body)
+	}
+}
+
+func TestIntegrationReady(t *testing.T) {
+	baseURL, cleanup := setupIntegrationServer(t)
+	defer cleanup()
+	resp, err := http.Get(baseURL + "/ready")
+	if err != nil {
+		t.Fatalf("GET /ready: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("GET /ready status %d, want 200", resp.StatusCode)
+	}
+	if !strings.Contains(string(body), "ok") {
+		t.Errorf("GET /ready body %q does not contain 'ok'", body)
+	}
+}
+
+func TestIntegrationACL_Deny(t *testing.T) {
+	rules := []acl.Rule{
+		{Action: "deny", Path: "/oauth/token"},
+	}
+	baseURL, cleanup := setupIntegrationServerWithACL(t, rules)
+	defer cleanup()
+
+	form := url.Values{}
+	form.Set("grant_type", "password")
+	form.Set("username", "integration@example.com")
+	form.Set("password", "pass123")
+	form.Set("client_id", "test-client")
+	resp, err := http.Post(baseURL+"/oauth/token", "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("ACL should deny /oauth/token with 403, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "access_denied") {
+		t.Errorf("body should contain access_denied, got %s", body)
+	}
+}
+
+func TestIntegrationACL_AllowOtherPaths(t *testing.T) {
+	rules := []acl.Rule{
+		{Action: "deny", Path: "/admin"},
+	}
+	baseURL, cleanup := setupIntegrationServerWithACL(t, rules)
+	defer cleanup()
+
+	// /oauth/token should still work (no matching rule = allow)
+	form := url.Values{}
+	form.Set("grant_type", "password")
+	form.Set("username", "integration@example.com")
+	form.Set("password", "pass123")
+	form.Set("client_id", "test-client")
+	resp, err := http.Post(baseURL+"/oauth/token", "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("ACL should allow /oauth/token, got %d", resp.StatusCode)
+	}
+}
+
+func TestIntegrationLoginCustomTemplate(t *testing.T) {
+	tpl := `<!DOCTYPE html><html><body><h1>Custom Login</h1>
+<form method="post" action="/login">
+<input type="hidden" name="client_id" value="{{.ClientID}}">
+<input type="hidden" name="redirect_uri" value="{{.RedirectURI}}">
+<input type="hidden" name="scope" value="{{.Scope}}">
+<input type="hidden" name="state" value="{{.State}}">
+<input type="hidden" name="response_type" value="{{.ResponseType}}">
+<input type="hidden" name="nonce" value="{{.Nonce}}">
+<input type="hidden" name="audience" value="{{.Audience}}">
+<input type="hidden" name="code_challenge" value="{{.CodeChallenge}}">
+<input type="hidden" name="code_challenge_method" value="{{.CodeChallengeMethod}}">
+<input type="text" name="username" value="{{.LoginHint}}">
+<input type="password" name="password">
+<button type="submit">Sign in</button></form></body></html>`
+	dir := t.TempDir()
+	tplPath := filepath.Join(dir, "login_custom.html")
+	if err := os.WriteFile(tplPath, []byte(tpl), 0644); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+	os.Setenv("LOGIN_PAGE_TEMPLATE", tplPath)
+	defer os.Unsetenv("LOGIN_PAGE_TEMPLATE")
+
+	baseURL, cleanup := setupIntegrationServer(t)
+	defer cleanup()
+
+	resp, err := http.Get(baseURL + "/login?client_id=custom-client&redirect_uri=http://localhost/cb&scope=openid&state=st1&response_type=code&login_hint=user@example.com")
+	if err != nil {
+		t.Fatalf("GET /login: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("status %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "Custom Login") {
+		t.Errorf("body should contain custom template title, got %s", body)
+	}
+	if !strings.Contains(string(body), "custom-client") {
+		t.Errorf("body should contain client_id, got %s", body)
+	}
+}
+
+func TestIntegrationGraphQL(t *testing.T) {
+	os.Setenv("GRAPHQL_TEST_API_ENABLED", "true")
+	os.Setenv("ADMIN_API_KEY", "integration-admin-key")
+	defer func() {
+		os.Unsetenv("GRAPHQL_TEST_API_ENABLED")
+		os.Unsetenv("ADMIN_API_KEY")
+	}()
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "auth0.db")
+	st, err := store.NewSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLite: %v", err)
+	}
+	issuer, err := token.NewIssuer("http://localhost:0/")
+	if err != nil {
+		t.Fatalf("NewIssuer: %v", err)
+	}
+	grantStore := grants.NewStore(5*time.Minute, 24*time.Hour)
+	h := &handlers.Handlers{
+		Store:      st,
+		Issuer:     issuer,
+		IssuerURL:  "http://localhost:0",
+		GrantStore: grantStore,
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/graphql", graphql.Handler(st))
+	mux.Handle("/", h)
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	srv := &http.Server{Handler: mux}
+	go srv.Serve(listener)
+	time.Sleep(50 * time.Millisecond)
+	baseURL := "http://" + listener.Addr().String()
+	defer func() {
+		srv.Shutdown(context.Background())
+		st.Close()
+	}()
+
+	reqBody := `{"query":"mutation { createUser(email: \"gql-int@example.com\", password: \"SecurePass123!\", name: \"GQL Integration\") { id email name } }"}`
+	req, _ := http.NewRequest("POST", baseURL+"/graphql", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer integration-admin-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("graphql status %d: %s", resp.StatusCode, b)
+	}
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result == nil {
+		t.Fatal("empty graphql response")
+	}
+	if errs, ok := result["errors"]; ok && errs != nil {
+		t.Errorf("graphql errors: %v", errs)
+	}
+	data, _ := result["data"].(map[string]interface{})
+	createUser, _ := data["createUser"].(map[string]interface{})
+	if createUser["email"] != "gql-int@example.com" {
+		t.Errorf("email = %v", createUser["email"])
+	}
+}
+
 func TestIntegrationMetrics(t *testing.T) {
 	baseURL, cleanup := setupIntegrationServer(t)
 	defer cleanup()
@@ -106,12 +359,12 @@ func TestIntegrationMetrics(t *testing.T) {
 		t.Errorf("GET /metrics status %d", resp.StatusCode)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "fake_auth") && !strings.Contains(string(body), "authorize") {
+	if !strings.Contains(string(body), "auth2") && !strings.Contains(string(body), "authorize") {
 		preview := string(body)
 		if len(preview) > 200 {
 			preview = preview[:200]
 		}
-		t.Errorf("metrics body should contain 'fake_auth' or 'authorize', got %q", preview)
+		t.Errorf("metrics body should contain 'auth2' or 'authorize', got %q", preview)
 	}
 }
 
@@ -644,7 +897,7 @@ func TestIntegrationOAuthFlows(t *testing.T) {
 	})
 
 	t.Run("signup_and_login", func(t *testing.T) {
-		body := bytes.NewBufferString(`{"email":"newuser@test.com","password":"newpass"}`)
+		body := bytes.NewBufferString(`{"email":"newuser@test.com","password":"NewPass9"}`)
 		signupResp, err := http.Post(baseURL+"/dbconnections/signup", "application/json", body)
 		if err != nil {
 			t.Fatal(err)
@@ -656,7 +909,7 @@ func TestIntegrationOAuthFlows(t *testing.T) {
 		form := url.Values{}
 		form.Set("grant_type", "password")
 		form.Set("username", "newuser@test.com")
-		form.Set("password", "newpass")
+		form.Set("password", "NewPass9")
 		loginResp, _ := http.Post(baseURL+"/oauth/token", "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
 		if loginResp.StatusCode != 200 {
 			b, _ := io.ReadAll(loginResp.Body)
@@ -689,4 +942,123 @@ func TestIntegrationOAuthFlows(t *testing.T) {
 			t.Fatalf("jwks status %d", jwksResp.StatusCode)
 		}
 	})
+}
+
+func TestIntegrationSCIM(t *testing.T) {
+	os.Setenv("PASSWORD_POLICY_MIN_LENGTH", "6")
+	defer os.Unsetenv("PASSWORD_POLICY_MIN_LENGTH")
+
+	baseURL, cleanup := setupIntegrationServer(t)
+	defer cleanup()
+
+	// SCIM list users (no auth when SCIM_API_TOKEN not set)
+	resp, err := http.Get(baseURL + "/scim/v2/Users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("GET /scim/v2/Users: %d %s", resp.StatusCode, b)
+	}
+	var list struct {
+		TotalResults int `json:"totalResults"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if list.TotalResults < 1 {
+		t.Errorf("expected at least 1 user (seed), got %d", list.TotalResults)
+	}
+
+	// SCIM create user
+	createBody := `{"userName":"scim-user@example.com","name":{"givenName":"Scim","familyName":"User"},"password":"ChangeMe123!"}`
+	createResp, err := http.Post(baseURL+"/scim/v2/Users", "application/scim+json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer createResp.Body.Close()
+	if createResp.StatusCode != 201 {
+		b, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("POST /scim/v2/Users: %d %s", createResp.StatusCode, b)
+	}
+	var created struct {
+		ID       string `json:"id"`
+		UserName string `json:"userName"`
+	}
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created: %v", err)
+	}
+	if created.UserName != "scim-user@example.com" {
+		t.Errorf("userName = %q", created.UserName)
+	}
+
+	// SCIM get user
+	getResp, err := http.Get(baseURL + "/scim/v2/Users/" + created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer getResp.Body.Close()
+	if getResp.StatusCode != 200 {
+		t.Fatalf("GET /scim/v2/Users/{id}: %d", getResp.StatusCode)
+	}
+}
+
+func TestIntegrationOrganizations(t *testing.T) {
+	baseURL, cleanup := setupIntegrationServer(t)
+	defer cleanup()
+
+	// Create organization (no admin auth in dev mode)
+	body := `{"name":"Test Org","display_name":"Test Organization"}`
+	resp, err := http.Post(baseURL+"/api/v2/organizations", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 201 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("POST /api/v2/organizations: %d %s", resp.StatusCode, b)
+	}
+	var org struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&org); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if org.Name != "Test Org" {
+		t.Errorf("name = %q", org.Name)
+	}
+
+	// List organizations (returns array)
+	listResp, err := http.Get(baseURL + "/api/v2/organizations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listResp.Body.Close()
+	if listResp.StatusCode != 200 {
+		t.Fatalf("GET /api/v2/organizations: %d", listResp.StatusCode)
+	}
+	var list []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(listResp.Body).Decode(&list); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(list) < 1 {
+		t.Error("expected at least 1 organization")
+	}
+
+	// Add member
+	memberBody := `{"user_id":"auth0|int-user","role":"member"}`
+	memberResp, err := http.Post(baseURL+"/api/v2/organizations/"+org.ID+"/members", "application/json", strings.NewReader(memberBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer memberResp.Body.Close()
+	if memberResp.StatusCode != 201 && memberResp.StatusCode != 200 {
+		b, _ := io.ReadAll(memberResp.Body)
+		t.Fatalf("POST members: %d %s", memberResp.StatusCode, b)
+	}
 }

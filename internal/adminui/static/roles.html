@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Roles — auth2 Admin</title>
+  <link rel="stylesheet" href="/admin/style.css">
+</head>
+<body class="admin">
+  <nav class="admin-nav">
+    <a href="/admin/">Dashboard</a>
+    <a href="/admin/users.html">Users</a>
+    <a href="/admin/clients.html">Clients</a>
+    <a href="/admin/roles.html">Roles</a>
+    <a href="/admin/logs.html">Logs</a>
+    <a href="/admin/logout" class="logout">Log out</a>
+  </nav>
+  <main>
+    <h1>Roles</h1>
+    <div id="loading">Loading...</div>
+    <div id="error" class="error" hidden></div>
+    <div id="content" hidden>
+      <table class="data-table">
+        <thead>
+          <tr><th>ID</th><th>Name</th><th>Description</th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </main>
+  <script src="/admin/app.js"></script>
+  <script>
+    (function() {
+      function getAuth() { return { headers: adminAuth(); }; }
+      document.getElementById('loading').hidden = false;
+      fetch('/api/v2/roles', getAuth())
+        .then(r => { if (!r.ok) throw new Error(r.statusText); return r.json(); })
+        .then(data => {
+          const roles = Array.isArray(data) ? data : (data.roles || []);
+          const tbody = document.getElementById('rows');
+          tbody.innerHTML = roles.map(r => {
+            const id = escapeHtml(r.id || '');
+            const name = escapeHtml(r.name || '');
+            const desc = escapeHtml(r.description || '');
+            return `<tr><td>${id}</td><td>${name}</td><td>${desc}</td></tr>`;
+          }).join('');
+          document.getElementById('loading').hidden = true;
+          document.getElementById('content').hidden = false;
+        })
+        .catch(e => {
+          document.getElementById('loading').hidden = true;
+          document.getElementById('error').textContent = e.message || 'Failed to load roles';
+          document.getElementById('error').hidden = false;
+        });
+    })();
+  </script>
+</body>
+</html>

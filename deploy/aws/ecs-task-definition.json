@@ -1,0 +1,63 @@
+{
+  "family": "auth2",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "auth2",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/auth2:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "PORT",
+          "value": "8080"
+        },
+        {
+          "name": "ISSUER_URL",
+          "value": "https://auth2.example.com"
+        },
+        {
+          "name": "DB_PATH",
+          "value": "/data/auth0.db"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "DB_DSN",
+          "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:auth2/db-dsn"
+        },
+        {
+          "name": "REDIS_URL",
+          "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:auth2/redis-url"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/auth2",
+          "awslogs-region": "us-east-1"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "wget -q -O- http://localhost:8080/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "linuxParameters": {
+        "initProcessEnabled": true
+      }
+    }
+  ]
+}

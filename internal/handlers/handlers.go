@@ -1,41 +1,74 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"html"
 	"math/big"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
+	"text/template"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/jmadler/fake-auth/internal/clients"
-	"github.com/jmadler/fake-auth/internal/grants"
-	"github.com/jmadler/fake-auth/internal/metrics"
-	"github.com/jmadler/fake-auth/internal/audit"
-	"github.com/jmadler/fake-auth/internal/pkce"
-	"github.com/jmadler/fake-auth/internal/rules"
-	"github.com/jmadler/fake-auth/internal/sessions"
-	"github.com/jmadler/fake-auth/internal/store"
-	"github.com/jmadler/fake-auth/internal/token"
+	"github.com/redis/go-redis/v9"
+	"github.com/jmadler/auth2/internal/audit"
+	"github.com/jmadler/auth2/internal/clients"
+	"github.com/jmadler/auth2/internal/fapi"
+	"github.com/jmadler/auth2/internal/enterprise"
+	"github.com/jmadler/auth2/internal/email"
+	"github.com/jmadler/auth2/internal/grants"
+	"github.com/jmadler/auth2/internal/metrics"
+	"github.com/jmadler/auth2/internal/password"
+	"github.com/jmadler/auth2/internal/pkce"
+	"github.com/jmadler/auth2/internal/rules"
+	"github.com/jmadler/auth2/internal/sessions"
+	"github.com/jmadler/auth2/internal/sms"
+	"github.com/jmadler/auth2/internal/social"
+	"github.com/jmadler/auth2/internal/store"
+	"github.com/jmadler/auth2/internal/token"
+	"github.com/jmadler/auth2/internal/tokenvault"
 )
 
-const sessionCookieName = "fake_auth_session"
+const sessionCookieName = "auth2_session"
 const sessionCookieMaxAge = 86400 * 7 // 7 days
 
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.Index(xff, ","); i >= 0 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	return ip
+}
+
 type Handlers struct {
-	Store               *store.SQLiteStore
+	Store               store.Store
 	Issuer              *token.Issuer
 	IssuerURL           string
-	GrantStore          *grants.Store
+	GrantStore          grants.GrantStore  // nil = no grant storage
 	RulesRunner         *rules.Runner
-	ClientRegistry      *clients.Registry // nil = no client validation
-	SessionStore        *sessions.Store   // nil = no server-side sessions
+	ClientRegistry      *clients.Registry  // nil = no client validation
+	SessionStore        sessions.Store    // nil = no server-side sessions
+	RedisClient         *redis.Client     // optional, for health check when Redis is used
 	AccessTokenLifetime int               // seconds, 0 = default 86400
 	IDTokenLifetime     int               // seconds, 0 = default 86400
+	MFAEnabled          bool              // MFA_ENABLED env; enables MFA endpoints and password-grant challenge
+	AdaptiveMFAEnabled  bool              // ADAPTIVE_MFA_ENABLED; only require MFA when risky (new IP, no session)
+	WebAuthnHandler     http.Handler     // optional; handles /webauthn/* when set
+	SAMLConfig          *SAMLConfig      // optional; for SAML IdP (entity_id, cert, key)
+	AdminAPIKey         string           // optional; for token vault admin access
 }
 
 func (h *Handlers) accessTokenLifetime() int {
@@ -56,13 +89,7 @@ func (h *Handlers) issuerURL() string {
 	if h.IssuerURL != "" {
 		return strings.TrimSuffix(h.IssuerURL, "/")
 	}
-	return "https://fake-auth.example.com"
-}
-
-func corsHeaders(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, DELETE, PATCH")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	return "https://auth2.example.com"
 }
 
 func setRateLimitHeaders(w http.ResponseWriter) {
@@ -72,15 +99,14 @@ func setRateLimitHeaders(w http.ResponseWriter) {
 }
 
 func (h *Handlers) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	corsHeaders(w)
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
 	path := strings.TrimSuffix(r.URL.Path, "/")
 	switch {
 	case r.Method == http.MethodGet && path == "/health":
 		h.handleHealth(w, r)
+	case r.Method == http.MethodGet && path == "/live":
+		h.handleLive(w)
+	case r.Method == http.MethodGet && path == "/ready":
+		h.handleReady(w, r)
 	case r.Method == http.MethodGet && path == "/metrics":
 		h.handleMetrics(w, r)
 	case r.Method == http.MethodGet && path == "/authorize":
@@ -97,20 +123,48 @@ func (h *Handlers) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleDeviceCodeRequest(w, r)
 	case (r.Method == http.MethodGet || r.Method == http.MethodPost) && path == "/oauth/device/authorize":
 		h.handleDeviceAuthorize(w, r)
+	case r.Method == http.MethodPost && path == "/oauth/ciba/request":
+		h.handleCIBARequest(w, r)
+	case (r.Method == http.MethodGet || r.Method == http.MethodPost) && path == "/ciba/verify":
+		h.handleCIBAVerify(w, r)
 	case r.Method == http.MethodGet && path == "/userinfo":
 		h.handleUserinfo(w, r)
 	case r.Method == http.MethodPost && path == "/tokeninfo":
 		h.handleTokeninfo(w, r)
 	case r.Method == http.MethodPost && path == "/dbconnections/signup":
 		h.handleSignup(w, r)
+	case r.Method == http.MethodPost && path == "/dbconnections/change_password":
+		h.handleChangePassword(w, r)
+	case r.Method == http.MethodPost && path == "/passwordless/start":
+		h.handlePasswordlessStart(w, r)
+	case r.Method == http.MethodPost && path == "/passwordless/reset":
+		h.handlePasswordReset(w, r)
+	case r.Method == http.MethodGet && path == "/passwordless/verify":
+		h.handlePasswordlessVerify(w, r)
+	case r.Method == http.MethodPost && path == "/passwordless/confirm":
+		h.handlePasswordResetConfirm(w, r)
+	case r.Method == http.MethodPost && path == "/mfa/enroll":
+		h.handleMFAEnroll(w, r)
+	case r.Method == http.MethodPost && path == "/mfa/verify":
+		h.handleMFAVerify(w, r)
+	case r.Method == http.MethodPost && path == "/mfa/challenge":
+		h.handleMFAChallenge(w, r)
+	case h.WebAuthnHandler != nil && strings.HasPrefix(path, "/webauthn/"):
+		h.WebAuthnHandler.ServeHTTP(w, r)
 	case r.Method == http.MethodGet && path == "/api/v2/users":
 		h.handleListUsers(w, r)
+	case r.Method == http.MethodGet && path == "/api/v2/users/export":
+		h.handleUsersExport(w, r)
+	case r.Method == http.MethodPost && path == "/api/v2/users/import":
+		h.handleUsersImport(w, r)
 	case r.Method == http.MethodPost && path == "/api/v2/users":
 		h.handleCreateUserMgmt(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/api/v2/users/") && strings.HasSuffix(path, "/blocks"):
 		h.handleGetUserBlocks(w, r, path)
 	case (r.Method == http.MethodPost || r.Method == http.MethodDelete) && strings.HasPrefix(path, "/api/v2/users/") && strings.HasSuffix(path, "/blocks"):
 		h.handleUserBlocksModify(w, r, path)
+	case r.Method == http.MethodGet && strings.HasPrefix(path, "/api/v2/users/") && strings.HasSuffix(path, "/export"):
+		h.handleUserGDPRExport(w, r, path)
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/api/v2/users/") && !strings.Contains(path, "/roles") && !strings.Contains(path, "/permissions") && !strings.Contains(path, "/blocks"):
 		h.handleGetUser(w, r, path)
 	case r.Method == http.MethodDelete && strings.HasPrefix(path, "/api/v2/users/") && !strings.Contains(path, "/roles") && !strings.Contains(path, "/permissions") && !strings.Contains(path, "/blocks"):
@@ -129,6 +183,18 @@ func (h *Handlers) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleUniversalLogin(w, r)
 	case r.Method == http.MethodGet && path == "/login/callback":
 		h.handleLoginCallback(w, r)
+	case r.Method == http.MethodGet && path == "/callback/social":
+		h.handleSocialCallback(w, r)
+	case r.Method == http.MethodGet && path == "/callback/enterprise":
+		h.handleEnterpriseCallback(w, r)
+	case r.Method == http.MethodGet && path == "/.well-known/saml-metadata":
+		h.handleSAMLMetadata(w, r)
+	case (r.Method == http.MethodGet || r.Method == http.MethodPost) && path == "/saml/sso":
+		h.handleSAMLSSO(w, r)
+	case r.Method == http.MethodPost && path == "/api/v2/saml/sp":
+		h.handleCreateSAMLSP(w, r)
+	case r.Method == http.MethodGet && path == "/login/enterprise":
+		h.handleLoginEnterprise(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/api/v2/users/") && strings.HasSuffix(path, "/roles"):
 		h.handleGetUserRoles(w, r, path)
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/api/v2/users/") && strings.HasSuffix(path, "/permissions"):
@@ -155,13 +221,79 @@ func (h *Handlers) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleGetConnection(w, r, path)
 	case r.Method == http.MethodGet && path == "/api/v2/logs":
 		h.handleListLogs(w, r)
+	case r.Method == http.MethodGet && path == "/api/v2/organizations":
+		h.handleListOrganizations(w, r)
+	case r.Method == http.MethodPost && path == "/api/v2/organizations":
+		h.handleCreateOrganization(w, r)
+	case r.Method == http.MethodGet && strings.HasPrefix(path, "/api/v2/organizations/") && !strings.Contains(strings.TrimPrefix(path, "/api/v2/organizations/"), "/"):
+		h.handleGetOrganization(w, r, path)
+	case r.Method == http.MethodPatch && strings.HasPrefix(path, "/api/v2/organizations/") && !strings.Contains(strings.TrimPrefix(path, "/api/v2/organizations/"), "/"):
+		h.handlePatchOrganization(w, r, path)
+	case r.Method == http.MethodDelete && strings.HasPrefix(path, "/api/v2/organizations/") && !strings.Contains(strings.TrimPrefix(path, "/api/v2/organizations/"), "/"):
+		h.handleDeleteOrganization(w, r, path)
+	case r.Method == http.MethodGet && strings.HasSuffix(path, "/members") && strings.HasPrefix(path, "/api/v2/organizations/"):
+		h.handleListOrgMembers(w, r, path)
+	case r.Method == http.MethodPost && strings.HasSuffix(path, "/members") && strings.HasPrefix(path, "/api/v2/organizations/"):
+		h.handleAddOrgMember(w, r, path)
+	case r.Method == http.MethodDelete && strings.HasSuffix(path, "/members") && strings.HasPrefix(path, "/api/v2/organizations/"):
+		h.handleRemoveOrgMember(w, r, path)
+	case r.Method == http.MethodGet && strings.HasSuffix(path, "/connections") && strings.HasPrefix(path, "/api/v2/organizations/"):
+		h.handleListOrgConnections(w, r, path)
+	case r.Method == http.MethodPost && strings.HasSuffix(path, "/connections") && strings.HasPrefix(path, "/api/v2/organizations/"):
+		h.handleAddOrgConnection(w, r, path)
+	case r.Method == http.MethodPost && strings.HasSuffix(path, "/invitations") && strings.HasPrefix(path, "/api/v2/organizations/"):
+		h.handleCreateOrgInvitation(w, r, path)
+	case r.Method == http.MethodGet && path == "/organizations/accept-invitation":
+		h.handleAcceptInvitation(w, r)
+	case tokenvault.Enabled() && r.Method == http.MethodPost && path == "/api/v2/token-vault":
+		h.handleTokenVaultStore(w, r)
+	case tokenvault.Enabled() && r.Method == http.MethodGet && strings.HasPrefix(path, "/api/v2/token-vault/"):
+		h.handleTokenVaultGet(w, r, path)
 	default:
 		http.NotFound(w, r)
 	}
 }
 
+// handleHealth is backward-compatible: same as /ready (DB+Redis checks).
+// Returns 200 when healthy, 503 when any check fails.
 func (h *Handlers) handleHealth(w http.ResponseWriter, r *http.Request) {
+	h.handleReady(w, r)
+}
+
+// handleLive is minimal liveness for K8s: returns 200 if process is up.
+// Use for livenessProbe; no dependency checks.
+func (h *Handlers) handleLive(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"ok"}`))
+}
+
+// handleReady is readiness for K8s: checks DB and Redis (if used).
+// Returns 503 if not ready. Use for readinessProbe.
+func (h *Handlers) handleReady(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	checks := make(map[string]string)
+
+	if err := h.Store.Ping(ctx); err != nil {
+		checks["database"] = err.Error()
+	}
+	if h.RedisClient != nil {
+		if err := h.RedisClient.Ping(ctx).Err(); err != nil {
+			checks["redis"] = err.Error()
+		}
+	}
+
+	if len(checks) > 0 {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "unhealthy",
+			"checks": checks,
+		})
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
@@ -200,6 +332,13 @@ func (h *Handlers) handleToken(w http.ResponseWriter, r *http.Request) {
 	if clientID == "" {
 		clientID = "e2e-test"
 	}
+	// FAPI: require PKCE for authorization_code when FAPI enabled
+	if fapi.Enabled() && grantType == "authorization_code" {
+		if p["code_verifier"] == "" {
+			sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "FAPI requires PKCE code_verifier for authorization_code"})
+			return
+		}
+	}
 	switch grantType {
 	case "client_credentials":
 		h.handleClientCredentials(w, r, clientID)
@@ -216,6 +355,9 @@ func (h *Handlers) handleToken(w http.ResponseWriter, r *http.Request) {
 	case "urn:ietf:params:oauth:grant-type:device_code":
 		h.handleDeviceCodeToken(w, r, p["device_code"], clientID)
 		return
+	case cibaGrantType:
+		h.handleCIBAToken(w, r, p["auth_req_id"], clientID)
+		return
 	default:
 		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported_grant_type"})
 	}
@@ -226,16 +368,84 @@ func (h *Handlers) handlePasswordGrant(w http.ResponseWriter, r *http.Request, u
 		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant", "error_description": "Wrong email or password."})
 		return
 	}
+	// Brute-force lockout check (by email/username)
+	if lockedUntil, locked := h.Store.IsLockedOut(r.Context(), username); locked {
+		sendJSON(w, http.StatusTooManyRequests, map[string]string{
+			"error":             "too_many_attempts",
+			"error_description": "Account temporarily locked. Try again after " + lockedUntil.Format(time.RFC3339) + ".",
+		})
+		return
+	}
 	u, err := h.Store.GetByEmail(r.Context(), username)
 	if err != nil || u == nil {
+		h.Store.RecordFailedLogin(r.Context(), username)
 		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant", "error_description": "Wrong email or password."})
 		return
 	}
 	if !h.Store.VerifyPassword(u.PasswordHash, password) {
+		h.Store.RecordFailedLogin(r.Context(), username)
 		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant", "error_description": "Wrong email or password."})
 		return
 	}
-	ruleUser := &rules.User{UserID: u.ID, Email: u.Email, EmailVerified: true, Name: u.DisplayName, Nickname: u.DisplayName}
+	// Success: clear failed login attempts
+	h.Store.ClearFailedLogins(r.Context(), username)
+
+	// MFA challenge: if MFA enabled, user has MFA, and GrantStore available, require MFA code
+	if h.MFAEnabled && h.GrantStore != nil {
+		en, _ := h.Store.GetMFAEnrollment(r.Context(), u.ID)
+		if en != nil && en.TOTPSecret != "" {
+			// Adaptive MFA: skip MFA if IP known and (for web) session present
+			if h.AdaptiveMFAEnabled {
+				ip := clientIP(r)
+				hasSession := false
+				if h.SessionStore != nil {
+					if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
+						if sess, ok := h.SessionStore.Get(c.Value); ok && sess != nil {
+							hasSession = true
+						}
+					}
+				}
+				ipKnown, _ := h.Store.IsIPKnownForUser(r.Context(), u.ID, ip)
+				if ipKnown || hasSession {
+					// Not risky: skip MFA challenge
+				} else {
+					// Risky: require MFA
+					challengeID := "mfa_" + uuid.New().String()
+					h.GrantStore.SaveMFAPending(challengeID, &grants.MFAPending{
+						UserID:   u.ID,
+						ClientID: clientID,
+						Scope:    scope,
+						Audience: audience,
+						ClientIP: ip,
+					})
+					sendJSON(w, http.StatusOK, map[string]interface{}{
+						"error":             "mfa_required",
+						"error_description": "Multi-factor authentication required",
+						"challenge_id":      challengeID,
+					})
+					return
+				}
+			} else {
+				// Non-adaptive: always require MFA
+				challengeID := "mfa_" + uuid.New().String()
+				h.GrantStore.SaveMFAPending(challengeID, &grants.MFAPending{
+					UserID:   u.ID,
+					ClientID: clientID,
+					Scope:    scope,
+					Audience: audience,
+					ClientIP: clientIP(r),
+				})
+				sendJSON(w, http.StatusOK, map[string]interface{}{
+					"error":             "mfa_required",
+					"error_description": "Multi-factor authentication required",
+					"challenge_id":      challengeID,
+				})
+				return
+			}
+		}
+	}
+
+	ruleUser := &rules.User{UserID: u.ID, Email: u.Email, EmailVerified: u.EmailVerified, Name: u.DisplayName, Nickname: u.DisplayName}
 	if h.RulesRunner != nil {
 		ruleUser, _ = h.RulesRunner.Run(ruleUser, &rules.Context{ClientID: clientID, Connection: "Username-Password-Authentication", Protocol: "oidc-basic-profile"})
 	}
@@ -356,7 +566,7 @@ func (h *Handlers) handleAuthorizationCode(w http.ResponseWriter, r *http.Reques
 		sendJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
 		return
 	}
-	ruleUser := &rules.User{UserID: u.ID, Email: u.Email, EmailVerified: true, Name: u.DisplayName, Nickname: u.DisplayName}
+	ruleUser := &rules.User{UserID: u.ID, Email: u.Email, EmailVerified: u.EmailVerified, Name: u.DisplayName, Nickname: u.DisplayName}
 	if h.RulesRunner != nil {
 		ruleUser, _ = h.RulesRunner.Run(ruleUser, &rules.Context{ClientID: effectiveClientID, Connection: "Username-Password-Authentication", Protocol: "oidc-basic-profile"})
 	}
@@ -651,7 +861,7 @@ func (h *Handlers) handleDeviceCodeToken(w http.ResponseWriter, r *http.Request,
 		sendJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
 		return
 	}
-	ruleUser := &rules.User{UserID: u.ID, Email: u.Email, EmailVerified: true, Name: u.DisplayName, Nickname: u.DisplayName}
+	ruleUser := &rules.User{UserID: u.ID, Email: u.Email, EmailVerified: u.EmailVerified, Name: u.DisplayName, Nickname: u.DisplayName}
 	if h.RulesRunner != nil {
 		ruleUser, _ = h.RulesRunner.Run(ruleUser, &rules.Context{ClientID: grant.ClientID, Connection: "Username-Password-Authentication", Protocol: "oidc-basic-profile"})
 	}
@@ -718,7 +928,7 @@ func (h *Handlers) handleImplicitAuthorize(w http.ResponseWriter, r *http.Reques
 	if aud == "" {
 		aud = "https://api.example.com"
 	}
-	ruleUser := &rules.User{UserID: u.ID, Email: u.Email, EmailVerified: true, Name: u.DisplayName, Nickname: u.DisplayName}
+	ruleUser := &rules.User{UserID: u.ID, Email: u.Email, EmailVerified: u.EmailVerified, Name: u.DisplayName, Nickname: u.DisplayName}
 	if h.RulesRunner != nil {
 		ruleUser, _ = h.RulesRunner.Run(ruleUser, &rules.Context{ClientID: clientID, Connection: "Username-Password-Authentication", Protocol: "oidc-basic-profile"})
 	}
@@ -776,6 +986,23 @@ func (h *Handlers) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	if codeChallengeMethod == "" {
 		codeChallengeMethod = "S256"
 	}
+	orgID := r.URL.Query().Get("organization_id")
+	if orgID == "" {
+		orgID = r.URL.Query().Get("org")
+	}
+
+	// FAPI validation (when enabled)
+	if fapi.Enabled() {
+		params := map[string]string{
+			"code_challenge":        codeChallenge,
+			"code_challenge_method": codeChallengeMethod,
+			"response_mode":         r.URL.Query().Get("response_mode"),
+		}
+		if errResp := fapi.ValidateFAPIRequest(r, params, false); errResp != nil {
+			sendJSON(w, http.StatusBadRequest, errResp)
+			return
+		}
+	}
 
 	// Redirect URI validation
 	if redirectURI == "" {
@@ -799,6 +1026,113 @@ func (h *Handlers) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	redirectURL, err := url.Parse(redirectURI)
 	if err != nil {
 		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "Invalid redirect_uri"})
+		return
+	}
+
+	// Self-service SSO: if login_hint or username has email domain matching enterprise_connection.domain_hint, redirect to that IdP
+	emailForDomain := loginHint
+	if emailForDomain == "" {
+		emailForDomain = username
+	}
+	if emailForDomain != "" {
+		if idx := strings.Index(emailForDomain, "@"); idx >= 0 {
+			domain := strings.ToLower(strings.TrimSpace(emailForDomain[idx+1:]))
+			if domain != "" {
+				ec, err := h.Store.GetEnterpriseConnectionByDomain(r.Context(), domain)
+				if err == nil && ec != nil && h.GrantStore != nil {
+					oauthState := "ent_" + uuid.New().String()
+					h.GrantStore.SaveSocialState(oauthState, &grants.SocialState{
+						RedirectURI:         redirectURI,
+						ClientID:            clientID,
+						Scope:               scope,
+						State:               state,
+						Nonce:               nonce,
+						CodeChallenge:       codeChallenge,
+						CodeChallengeMethod: codeChallengeMethod,
+						Audience:            audience,
+						ResponseType:        responseType,
+						Connection:          "enterprise:" + ec.ID,
+					})
+					authURL, err := buildEnterpriseOIDCAuthURL(ec, strings.TrimSuffix(h.issuerURL(), "/")+"/callback/enterprise", clientID, scope, oauthState)
+					if err == nil && authURL != "" {
+						http.Redirect(w, r, authURL, http.StatusFound)
+						return
+					}
+				}
+			}
+		}
+	}
+
+	// Enterprise OIDC: connection=okta (or name) redirects to enterprise IdP
+	connection := r.URL.Query().Get("connection")
+	if ec, err := h.Store.GetOIDCEnterpriseConnectionByName(r.Context(), connection); err == nil && ec != nil && h.GrantStore != nil {
+		oauthState := "ent_" + uuid.New().String()
+		callbackURL := strings.TrimSuffix(h.issuerURL(), "/") + "/callback/enterprise"
+		h.GrantStore.SaveSocialState(oauthState, &grants.SocialState{
+			RedirectURI:         redirectURI,
+			ClientID:            clientID,
+			Scope:               scope,
+			State:               state,
+			Nonce:               nonce,
+			CodeChallenge:       codeChallenge,
+			CodeChallengeMethod: codeChallengeMethod,
+			Audience:            audience,
+			ResponseType:        responseType,
+			Connection:          connection,
+		})
+		prov := enterprise.NewProvider(&enterprise.OIDCConnection{
+			Name: ec.Name, IssuerURL: ec.IssuerURL, ClientID: ec.ClientID,
+			ClientSecret: ec.ClientSecret, Scope: ec.Scope, DomainHint: ec.DomainHint,
+		})
+		authURL := prov.AuthURL(oauthState, callbackURL)
+		if authURL != "" {
+			http.Redirect(w, r, authURL, http.StatusFound)
+			return
+		}
+	}
+	// Social / federation: connection=google|github redirects to provider OAuth
+	if prov := social.GetProvider(connection); prov != nil && h.GrantStore != nil {
+		oauthState := "soc_" + uuid.New().String()
+		callbackURL := strings.TrimSuffix(h.issuerURL(), "/") + "/callback/social"
+		h.GrantStore.SaveSocialState(oauthState, &grants.SocialState{
+			RedirectURI:         redirectURI,
+			ClientID:            clientID,
+			Scope:               scope,
+			State:               state,
+			Nonce:               nonce,
+			CodeChallenge:       codeChallenge,
+			CodeChallengeMethod: codeChallengeMethod,
+			Audience:            audience,
+			ResponseType:        responseType,
+			Connection:          connection,
+		})
+		authURL := prov.AuthURL(oauthState, callbackURL)
+		http.Redirect(w, r, authURL, http.StatusFound)
+		return
+	}
+
+	// Passkey (WebAuthn) passwordless: prompt=passkey or connection=webauthn redirects to login with passkey option
+	if (prompt == "passkey" || connection == "webauthn") && h.WebAuthnHandler != nil {
+		loginURL := h.issuerURL() + "/login?client_id=" + url.QueryEscape(clientID) + "&redirect_uri=" + url.QueryEscape(redirectURI) + "&scope=" + url.QueryEscape(scope) + "&prompt=passkey"
+		if state != "" {
+			loginURL += "&state=" + url.QueryEscape(state)
+		}
+		if loginHint != "" {
+			loginURL += "&login_hint=" + url.QueryEscape(loginHint)
+		}
+		if audience != "" {
+			loginURL += "&audience=" + url.QueryEscape(audience)
+		}
+		if codeChallenge != "" {
+			loginURL += "&code_challenge=" + url.QueryEscape(codeChallenge) + "&code_challenge_method=" + url.QueryEscape(codeChallengeMethod)
+		}
+		if nonce != "" {
+			loginURL += "&nonce=" + url.QueryEscape(nonce)
+		}
+		if responseType != "" {
+			loginURL += "&response_type=" + url.QueryEscape(responseType)
+		}
+		http.Redirect(w, r, loginURL, http.StatusFound)
 		return
 	}
 
@@ -828,6 +1162,52 @@ func (h *Handlers) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 			redirectURL.RawQuery = q.Encode()
 			http.Redirect(w, r, redirectURL.String(), http.StatusFound)
 			return
+		}
+		// Organization: validate user is member when org_id present
+		if orgID != "" {
+			member, err := h.Store.IsOrgMember(r.Context(), orgID, u.ID)
+			if err != nil || !member {
+				metrics.AuthRequests.WithLabelValues("access_denied").Inc()
+				q := redirectURL.Query()
+				q.Set("error", "access_denied")
+				q.Set("error_description", "User is not a member of this organization")
+				if state != "" {
+					q.Set("state", state)
+				}
+				redirectURL.RawQuery = q.Encode()
+				http.Redirect(w, r, redirectURL.String(), http.StatusFound)
+				return
+			}
+		}
+		// Connection: when org_id and connection specified, validate connection is allowed for org
+		if orgID != "" && connection != "" {
+			orgConns, _ := h.Store.ListOrgConnections(r.Context(), orgID)
+			entConns, _ := h.Store.ListEnterpriseConnections(r.Context(), orgID)
+			allowed := false
+			for _, c := range orgConns {
+				if c == connection {
+					allowed = true
+					break
+				}
+			}
+			for _, ec := range entConns {
+				if ec.ID == connection || "enterprise:"+ec.ID == connection {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				metrics.AuthRequests.WithLabelValues("access_denied").Inc()
+				q := redirectURL.Query()
+				q.Set("error", "access_denied")
+				q.Set("error_description", "Connection not allowed for this organization")
+				if state != "" {
+					q.Set("state", state)
+				}
+				redirectURL.RawQuery = q.Encode()
+				http.Redirect(w, r, redirectURL.String(), http.StatusFound)
+				return
+			}
 		}
 		metrics.AuthRequests.WithLabelValues("success").Inc()
 		if h.SessionStore != nil {
@@ -884,6 +1264,22 @@ func (h *Handlers) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 			if sess, ok := h.SessionStore.Get(c.Value); ok && sess != nil {
 				u, err := h.Store.GetByID(r.Context(), sess.UserID)
 				if err == nil && u != nil && h.GrantStore != nil {
+					// Organization: validate user is member when org_id present
+					if orgID != "" {
+						member, err := h.Store.IsOrgMember(r.Context(), orgID, u.ID)
+						if err != nil || !member {
+							metrics.AuthRequests.WithLabelValues("access_denied").Inc()
+							q := redirectURL.Query()
+							q.Set("error", "access_denied")
+							q.Set("error_description", "User is not a member of this organization")
+							if state != "" {
+								q.Set("state", state)
+							}
+							redirectURL.RawQuery = q.Encode()
+							http.Redirect(w, r, redirectURL.String(), http.StatusFound)
+							return
+						}
+					}
 					metrics.AuthRequests.WithLabelValues("success").Inc()
 					code := "ac_" + uuid.New().String()
 					sessionID := "sid_" + uuid.New().String()
@@ -915,6 +1311,12 @@ func (h *Handlers) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	if state != "" {
 		loginURL += "&state=" + url.QueryEscape(state)
 	}
+	if orgID != "" {
+		loginURL += "&organization_id=" + url.QueryEscape(orgID)
+	}
+	if connection != "" {
+		loginURL += "&connection=" + url.QueryEscape(connection)
+	}
 	if loginHint != "" {
 		loginURL += "&login_hint=" + url.QueryEscape(loginHint)
 	}
@@ -937,6 +1339,48 @@ func getParam(r *http.Request, key string) string {
 	return r.FormValue(key)
 }
 
+// renderLoginPage returns the login HTML. If LOGIN_PAGE_TEMPLATE is set, loads that file
+// and executes it with the given data. Template vars: .ClientID, .RedirectURI, .Scope, .State,
+// .ResponseType, .Nonce, .Audience, .CodeChallenge, .CodeChallengeMethod, .LoginHint,
+// .OrganizationID, .Connection.
+// Custom template must POST to /login with hidden inputs of the same names.
+func renderLoginPage(data map[string]string) (string, error) {
+	tplPath := os.Getenv("LOGIN_PAGE_TEMPLATE")
+	if tplPath != "" {
+		body, err := os.ReadFile(tplPath)
+		if err != nil {
+			return "", err
+		}
+		t, err := template.New("login").Parse(string(body))
+		if err != nil {
+			return "", err
+		}
+		var buf strings.Builder
+		if err := t.Execute(&buf, data); err != nil {
+			return "", err
+		}
+		return buf.String(), nil
+	}
+	// Default login form
+	return `<!DOCTYPE html><html><head><title>Login</title></head><body>
+<form method="post" action="/login">
+<input type="hidden" name="client_id" value="` + html.EscapeString(data["ClientID"]) + `">
+<input type="hidden" name="redirect_uri" value="` + html.EscapeString(data["RedirectURI"]) + `">
+<input type="hidden" name="scope" value="` + html.EscapeString(data["Scope"]) + `">
+<input type="hidden" name="state" value="` + html.EscapeString(data["State"]) + `">
+<input type="hidden" name="response_type" value="` + html.EscapeString(data["ResponseType"]) + `">
+<input type="hidden" name="nonce" value="` + html.EscapeString(data["Nonce"]) + `">
+<input type="hidden" name="audience" value="` + html.EscapeString(data["Audience"]) + `">
+<input type="hidden" name="code_challenge" value="` + html.EscapeString(data["CodeChallenge"]) + `">
+<input type="hidden" name="code_challenge_method" value="` + html.EscapeString(data["CodeChallengeMethod"]) + `">
+<input type="hidden" name="organization_id" value="` + html.EscapeString(data["OrganizationID"]) + `">
+<input type="hidden" name="connection" value="` + html.EscapeString(data["Connection"]) + `">
+<label>Email: <input type="text" name="username" value="` + html.EscapeString(data["LoginHint"]) + `"></label><br>
+<label>Password: <input type="password" name="password"></label><br>
+<button type="submit">Log in</button>
+</form></body></html>`, nil
+}
+
 func (h *Handlers) handleLogin(w http.ResponseWriter, r *http.Request) {
 	clientID := getParam(r, "client_id")
 	redirectURI := getParam(r, "redirect_uri")
@@ -947,6 +1391,11 @@ func (h *Handlers) handleLogin(w http.ResponseWriter, r *http.Request) {
 	responseType := getParam(r, "response_type")
 	codeChallenge := getParam(r, "code_challenge")
 	codeChallengeMethod := getParam(r, "code_challenge_method")
+	orgID := getParam(r, "organization_id")
+	if orgID == "" {
+		orgID = getParam(r, "org")
+	}
+	connection := getParam(r, "connection")
 	if codeChallengeMethod == "" {
 		codeChallengeMethod = "S256"
 	}
@@ -961,6 +1410,12 @@ func (h *Handlers) handleLogin(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
 		username := r.FormValue("username")
 		password := r.FormValue("password")
+		if orgID == "" {
+			orgID = r.FormValue("organization_id")
+		}
+		if connection == "" {
+			connection = r.FormValue("connection")
+		}
 		if username == "" || password == "" {
 			http.Error(w, "username and password required", http.StatusBadRequest)
 			return
@@ -971,6 +1426,15 @@ func (h *Handlers) handleLogin(w http.ResponseWriter, r *http.Request) {
 			audit.LogLogin("", username, clientID, false, map[string]interface{}{"reason": "invalid_credentials"})
 			http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 			return
+		}
+		if orgID != "" {
+			member, err := h.Store.IsOrgMember(r.Context(), orgID, u.ID)
+			if err != nil || !member {
+				metrics.LoginAttempts.WithLabelValues("failed").Inc()
+				audit.LogLogin(u.ID, username, clientID, false, map[string]interface{}{"reason": "not_org_member"})
+				http.Error(w, "User is not a member of this organization", http.StatusForbidden)
+				return
+			}
 		}
 		metrics.LoginAttempts.WithLabelValues("success").Inc()
 		audit.LogLogin(u.ID, u.Email, clientID, true, nil)
@@ -997,7 +1461,7 @@ func (h *Handlers) handleLogin(w http.ResponseWriter, r *http.Request) {
 			if aud == "" {
 				aud = "https://api.example.com"
 			}
-			ruleUser := &rules.User{UserID: u.ID, Email: u.Email, EmailVerified: true, Name: u.DisplayName, Nickname: u.DisplayName}
+			ruleUser := &rules.User{UserID: u.ID, Email: u.Email, EmailVerified: u.EmailVerified, Name: u.DisplayName, Nickname: u.DisplayName}
 			if h.RulesRunner != nil {
 				ruleUser, _ = h.RulesRunner.Run(ruleUser, &rules.Context{ClientID: clientID, Connection: "Username-Password-Authentication", Protocol: "oidc-basic-profile"})
 			}
@@ -1065,21 +1529,24 @@ func (h *Handlers) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	loginHint := getParam(r, "login_hint")
-	loginHTML := `<!DOCTYPE html><html><head><title>Login</title></head><body>
-<form method="post" action="/login">
-<input type="hidden" name="client_id" value="` + html.EscapeString(clientID) + `">
-<input type="hidden" name="redirect_uri" value="` + html.EscapeString(redirectURI) + `">
-<input type="hidden" name="scope" value="` + html.EscapeString(scope) + `">
-<input type="hidden" name="state" value="` + html.EscapeString(state) + `">
-<input type="hidden" name="response_type" value="` + html.EscapeString(responseType) + `">
-<input type="hidden" name="nonce" value="` + html.EscapeString(nonce) + `">
-<input type="hidden" name="audience" value="` + html.EscapeString(audience) + `">
-<input type="hidden" name="code_challenge" value="` + html.EscapeString(codeChallenge) + `">
-<input type="hidden" name="code_challenge_method" value="` + html.EscapeString(codeChallengeMethod) + `">
-<label>Email: <input type="text" name="username" value="` + html.EscapeString(loginHint) + `"></label><br>
-<label>Password: <input type="password" name="password"></label><br>
-<button type="submit">Log in</button>
-</form></body></html>`
+	loginHTML, err := renderLoginPage(map[string]string{
+		"ClientID":            clientID,
+		"RedirectURI":         redirectURI,
+		"Scope":               scope,
+		"State":               state,
+		"ResponseType":        responseType,
+		"Nonce":               nonce,
+		"Audience":            audience,
+		"CodeChallenge":       codeChallenge,
+		"CodeChallengeMethod":  codeChallengeMethod,
+		"LoginHint":            loginHint,
+		"OrganizationID":       orgID,
+		"Connection":           connection,
+	})
+	if err != nil {
+		http.Error(w, "login template error", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(loginHTML))
 }
@@ -1102,6 +1569,20 @@ func (h *Handlers) handleSignup(w http.ResponseWriter, r *http.Request) {
 	if req.Password == "" {
 		req.Password = "password123"
 	}
+	if err := password.Validate(req.Password); err != nil {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_password", "description": err.Error()})
+		return
+	}
+	if password.IsBreachedCheckEnabled() {
+		if err := password.IsBreached(req.Password); err != nil {
+			if err == password.ErrBreached {
+				sendJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_password", "description": "This password has been found in a data breach and cannot be used. Please choose a different password."})
+				return
+			}
+			sendJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "breach_check_failed", "description": "Unable to verify password. Please try again later."})
+			return
+		}
+	}
 	orgID, entID := 1, 1
 	role := "user"
 	if req.UserMetadata != nil {
@@ -1121,10 +1602,12 @@ func (h *Handlers) handleSignup(w http.ResponseWriter, r *http.Request) {
 	if i := strings.Index(req.Email, "@"); i > 0 {
 		displayName = req.Email[:i]
 	}
+	emailVerified := handlersEmailVerificationRequired() == false // default verified when verification not required
 	u := &store.User{
 		ID:             uid,
 		Email:          req.Email,
 		DisplayName:    displayName,
+		EmailVerified:  emailVerified,
 		OrganizationID: orgID,
 		EnterpriseID:   entID,
 		Role:           role,
@@ -1140,6 +1623,593 @@ func (h *Handlers) handleSignup(w http.ResponseWriter, r *http.Request) {
 	metrics.Signups.Inc()
 	audit.LogSignup(u.ID, req.Email, nil)
 	sendJSON(w, http.StatusCreated, map[string]string{"email": req.Email, "_id": u.ID})
+}
+
+func (h *Handlers) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Email      string `json:"email"`
+		Connection string `json:"connection"`
+	}
+	ct := r.Header.Get("Content-Type")
+	if strings.Contains(ct, "application/json") {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	} else {
+		_ = r.ParseForm()
+		req.Email = r.FormValue("email")
+		req.Connection = r.FormValue("connection")
+	}
+	if req.Email == "" {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "Email required"})
+		return
+	}
+	u, err := h.Store.GetByEmail(r.Context(), req.Email)
+	if err != nil || u == nil {
+		// Don't reveal if user exists - always return success for Auth0 compatibility
+		sendJSON(w, http.StatusOK, map[string]string{"email": req.Email})
+		return
+	}
+	expiresAt := time.Now().Add(1 * time.Hour)
+	token, err := h.Store.CreatePasswordResetToken(r.Context(), u.ID, expiresAt)
+	if err != nil {
+		sendJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+		return
+	}
+	// In dev, optionally return token for testing (e.g. EMAIL_VERIFICATION_DEV_RETURN_TOKEN)
+	if os.Getenv("PASSWORD_RESET_DEV_RETURN_TOKEN") == "true" {
+		sendJSON(w, http.StatusOK, map[string]interface{}{"email": req.Email, "reset_token": token})
+		return
+	}
+	// Production: would send email here. For now just acknowledge.
+	sendJSON(w, http.StatusOK, map[string]string{"email": req.Email})
+}
+
+func (h *Handlers) handlePasswordlessStart(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Email        string `json:"email"`
+		PhoneNumber  string `json:"phone_number"`
+		Phone        string `json:"phone"`
+		AuthType     string `json:"auth_type"`
+		ClientID     string `json:"client_id"`
+		RedirectURI  string `json:"redirect_uri"`
+		State        string `json:"state"`
+		ResponseType string `json:"response_type"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "Invalid JSON"})
+		return
+	}
+	if req.AuthType == "sms" {
+		h.handlePasswordlessStartSMS(w, r, &req)
+		return
+	}
+	// magiclink (default)
+	if req.Email == "" {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "email is required"})
+		return
+	}
+	if req.AuthType != "magiclink" && req.AuthType != "" {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "auth_type must be magiclink or sms"})
+		return
+	}
+	if req.ClientID == "" {
+		req.ClientID = "e2e-test"
+	}
+	if req.RedirectURI == "" {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "redirect_uri is required"})
+		return
+	}
+	if h.ClientRegistry != nil && !h.ClientRegistry.ValidateRedirectURI(req.ClientID, req.RedirectURI) {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "redirect_uri not allowed for this client"})
+		return
+	}
+	if req.ResponseType == "" {
+		req.ResponseType = "code"
+	}
+
+	data := &store.MagicLinkTokenData{
+		Email:        req.Email,
+		ClientID:     req.ClientID,
+		RedirectURI:  req.RedirectURI,
+		State:        req.State,
+		ResponseType: req.ResponseType,
+		Scope:        "openid profile",
+		Audience:     "",
+	}
+	token, err := h.Store.CreateMagicLinkToken(r.Context(), data)
+	if err != nil {
+		sendJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+		return
+	}
+
+	base := h.issuerURL()
+	link := base + "/passwordless/verify?token=" + url.QueryEscape(token)
+	if req.State != "" {
+		link += "&state=" + url.QueryEscape(req.State)
+	}
+
+	devReturn := os.Getenv("MAGIC_LINK_DEV_RETURN_TOKEN") == "true"
+	if devReturn {
+		sendJSON(w, http.StatusOK, map[string]interface{}{
+			"email":   req.Email,
+			"_id":     req.Email,
+			"request": "magiclink",
+			"token":   token,
+			"link":    link,
+		})
+		return
+	}
+
+	smtpCfg := email.LoadFromEnv()
+	if smtpCfg != nil {
+		if err := smtpCfg.SendMagicLink(req.Email, link); err != nil {
+			audit.Log(audit.Event{Type: "magic_link_email_failed", ClientID: req.ClientID, Success: false, Details: map[string]interface{}{"error": err.Error()}})
+		}
+	}
+
+	sendJSON(w, http.StatusOK, map[string]interface{}{
+		"email":   req.Email,
+		"_id":     req.Email,
+		"request": "magiclink",
+	})
+}
+
+func (h *Handlers) handlePasswordlessStartSMS(w http.ResponseWriter, r *http.Request, req *struct {
+	Email        string `json:"email"`
+	PhoneNumber  string `json:"phone_number"`
+	Phone        string `json:"phone"`
+	AuthType     string `json:"auth_type"`
+	ClientID     string `json:"client_id"`
+	RedirectURI  string `json:"redirect_uri"`
+	State        string `json:"state"`
+	ResponseType string `json:"response_type"`
+}) {
+	phone := req.PhoneNumber
+	if phone == "" {
+		phone = req.Phone
+	}
+	if phone == "" {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "phone_number is required for auth_type=sms"})
+		return
+	}
+	if req.ClientID == "" {
+		req.ClientID = "e2e-test"
+	}
+	if req.RedirectURI == "" {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "redirect_uri is required"})
+		return
+	}
+	if h.ClientRegistry != nil && !h.ClientRegistry.ValidateRedirectURI(req.ClientID, req.RedirectURI) {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "redirect_uri not allowed for this client"})
+		return
+	}
+	if req.ResponseType == "" {
+		req.ResponseType = "code"
+	}
+	code := randomOTP6()
+	data := &store.SMSOTPTokenData{
+		Phone:        phone,
+		Code:         code,
+		ClientID:     req.ClientID,
+		RedirectURI:  req.RedirectURI,
+		State:        req.State,
+		ResponseType: req.ResponseType,
+		Scope:        "openid profile",
+		Audience:     "",
+	}
+	token, err := h.Store.CreateSMSOTPToken(r.Context(), data)
+	if err != nil {
+		sendJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+		return
+	}
+	if err := sms.SendOTP(phone, code); err != nil {
+		audit.Log(audit.Event{Type: "sms_otp_send_failed", ClientID: req.ClientID, Success: false, Details: map[string]interface{}{"error": err.Error()}})
+	}
+	devReturn := os.Getenv("SMS_OTP_DEV_RETURN_CODE") == "true"
+	resp := map[string]interface{}{
+		"phone_number": phone,
+		"_id":          phone,
+		"request":      "sms",
+	}
+	if devReturn {
+		resp["code"] = code
+		resp["token"] = token
+	}
+	sendJSON(w, http.StatusOK, resp)
+}
+
+func randomOTP6() string {
+	n, _ := rand.Int(rand.Reader, big.NewInt(1000000))
+	c := int(n.Int64())
+	if c < 100000 {
+		c += 100000
+	}
+	return strconv.Itoa(c)
+}
+
+func (h *Handlers) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "Invalid JSON"})
+		return
+	}
+	if req.Email == "" {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "Email required"})
+		return
+	}
+	u, err := h.Store.GetByEmail(r.Context(), req.Email)
+	if err != nil || u == nil {
+		sendJSON(w, http.StatusOK, map[string]string{"message": "If that email exists, a reset link has been sent."})
+		return
+	}
+	expiresAt := time.Now().Add(1 * time.Hour)
+	token, err := h.Store.CreatePasswordResetToken(r.Context(), u.ID, expiresAt)
+	if err != nil {
+		sendJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+		return
+	}
+	if os.Getenv("PASSWORD_RESET_DEV_RETURN_TOKEN") == "true" {
+		sendJSON(w, http.StatusOK, map[string]interface{}{"email": req.Email, "reset_token": token})
+		return
+	}
+	sendJSON(w, http.StatusOK, map[string]string{"message": "If that email exists, a reset link has been sent."})
+}
+
+func (h *Handlers) handlePasswordlessVerify(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`<!DOCTYPE html><html><body><p>Token is required.</p></body></html>`))
+		return
+	}
+	state := r.URL.Query().Get("state")
+	code := r.URL.Query().Get("code")
+
+	// Magic link: token prefix magic_
+	if strings.HasPrefix(token, "magic_") {
+		h.handleMagicLinkVerify(w, r, token, state)
+		return
+	}
+
+	// SMS OTP: token prefix sms_
+	if strings.HasPrefix(token, "sms_") {
+		if code == "" {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`<!DOCTYPE html><html><body><p>Code is required for SMS verification. Use ?token=...&code=123456</p></body></html>`))
+			return
+		}
+		h.handleSMSOTPVerify(w, r, token, code, state)
+		return
+	}
+
+	// Password reset: token prefix prt_
+	userID, ok := h.Store.ValidatePasswordResetToken(r.Context(), token)
+	if !ok {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`<!DOCTYPE html><html><body><p>Invalid or expired token.</p></body></html>`))
+		return
+	}
+	_ = userID
+	base := h.issuerURL()
+	html := `<!DOCTYPE html><html><head><title>Reset Password</title></head><body>
+<h2>Reset your password</h2>
+<form method="post" action="` + base + `/passwordless/confirm">
+<input type="hidden" name="token" value="` + html.EscapeString(token) + `">
+<label>New password: <input type="password" name="new_password" minlength="8" required></label><br>
+<button type="submit">Submit</button>
+</form></body></html>`
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(html))
+}
+
+func (h *Handlers) handleSMSOTPVerify(w http.ResponseWriter, r *http.Request, tokenStr, code, queryState string) {
+	data, ok := h.Store.ConsumeSMSOTPToken(r.Context(), tokenStr, code)
+	if !ok {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`<!DOCTYPE html><html><body><p>Invalid or expired SMS code.</p></body></html>`))
+		return
+	}
+	redirectURI := data.RedirectURI
+	state := data.State
+	if queryState != "" {
+		state = queryState
+	}
+	u, err := h.Store.GetByPhone(r.Context(), data.Phone)
+	if err != nil || u == nil {
+		u = &store.User{
+			ID:            "auth0|" + uuid.New().String(),
+			Email:         "sms:" + data.Phone,
+			PhoneNumber:   data.Phone,
+			PasswordHash:  "",
+			DisplayName:   data.Phone,
+			EmailVerified: false,
+		}
+		placeholder := "x" + uuid.New().String()
+		if err := h.Store.CreateUser(r.Context(), u, placeholder); err != nil {
+			sendJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+			return
+		}
+		audit.LogSignup(u.ID, data.Phone, nil)
+	}
+	if h.SessionStore != nil {
+		if sessionID, err := h.SessionStore.Create(u.ID, u.Email); err == nil {
+			http.SetCookie(w, &http.Cookie{
+				Name:     sessionCookieName,
+				Value:    sessionID,
+				Path:     "/",
+				MaxAge:   sessionCookieMaxAge,
+				HttpOnly: true,
+				Secure:   strings.HasPrefix(h.issuerURL(), "https://"),
+				SameSite: http.SameSiteLaxMode,
+			})
+		}
+	}
+	redirectURL, err := url.Parse(redirectURI)
+	if err != nil {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "Invalid redirect_uri"})
+		return
+	}
+	aud := data.Audience
+	if aud == "" && data.ClientID != "" {
+		aud = data.ClientID
+	}
+	if aud == "" {
+		aud = "https://api.example.com"
+	}
+	ruleUser := &rules.User{UserID: u.ID, Email: u.Email, EmailVerified: u.EmailVerified, Name: u.DisplayName, Nickname: u.DisplayName}
+	if h.RulesRunner != nil {
+		ruleUser, _ = h.RulesRunner.Run(ruleUser, &rules.Context{ClientID: data.ClientID, Connection: "sms", Protocol: "oidc-basic-profile"})
+	}
+	emailVal, displayName := ruleUser.Email, ruleUser.Name
+	if displayName == "" {
+		displayName = ruleUser.Nickname
+	}
+	if displayName == "" {
+		displayName = emailVal
+	}
+	if displayName == "" {
+		displayName = data.Phone
+	}
+	respType := data.ResponseType
+	if respType == "" {
+		respType = "code"
+	}
+	if strings.Contains(respType, "token") || strings.Contains(respType, "id_token") {
+		var frag []string
+		if strings.Contains(respType, "token") {
+			accessTok, err := h.Issuer.Issue(u.ID, aud, data.ClientID, h.accessTokenLifetime(), ruleUser.AccessTokenClaims)
+			if err == nil {
+				frag = append(frag, "access_token="+url.QueryEscape(accessTok), "token_type=Bearer", "expires_in="+strconv.Itoa(h.accessTokenLifetime()))
+			}
+		}
+		if strings.Contains(respType, "id_token") {
+			opts := &token.IDTokenOptions{AMR: []string{"sms"}, CustomClaims: ruleUser.IDTokenClaims}
+			idTok, err := h.Issuer.IssueIDToken(u.ID, aud, data.ClientID, h.idTokenLifetime(), data.Scope, emailVal, displayName, "", opts)
+			if err == nil {
+				frag = append(frag, "id_token="+url.QueryEscape(idTok))
+			}
+		}
+		if state != "" {
+			frag = append(frag, "state="+url.QueryEscape(state))
+		}
+		dest := redirectURL.String()
+		if redirectURL.RawQuery != "" {
+			dest = strings.TrimSuffix(dest, "?"+redirectURL.RawQuery)
+		}
+		http.Redirect(w, r, dest+"#"+strings.Join(frag, "&"), http.StatusFound)
+		return
+	}
+	if h.GrantStore == nil {
+		sendJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error", "error_description": "Authorization code flow not configured"})
+		return
+	}
+	authCode := "ac_" + uuid.New().String()
+	sessionID := "sid_" + uuid.New().String()
+	h.GrantStore.SaveCode(authCode, &grants.AuthCode{
+		UserID:      u.ID,
+		ClientID:    data.ClientID,
+		RedirectURI: redirectURI,
+		Scope:       data.Scope,
+		Nonce:       "",
+		SessionID:   sessionID,
+		Audience:    aud,
+	})
+	q := redirectURL.Query()
+	q.Set("code", authCode)
+	if state != "" {
+		q.Set("state", state)
+	}
+	redirectURL.RawQuery = q.Encode()
+	audit.LogToken("sms_otp", u.ID, data.ClientID, true, nil)
+	http.Redirect(w, r, redirectURL.String(), http.StatusFound)
+}
+
+func (h *Handlers) handleMagicLinkVerify(w http.ResponseWriter, r *http.Request, magicToken, queryState string) {
+	data, ok := h.Store.ConsumeMagicLinkToken(r.Context(), magicToken)
+	if !ok {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`<!DOCTYPE html><html><body><p>Invalid or expired magic link.</p></body></html>`))
+		return
+	}
+	redirectURI := data.RedirectURI
+	state := data.State
+	if queryState != "" {
+		state = queryState
+	}
+
+	// Create or get user, email_verified=true
+	u, err := h.Store.GetByEmail(r.Context(), data.Email)
+	if err != nil || u == nil {
+		u = &store.User{
+			ID:            "auth0|" + uuid.New().String(),
+			Email:         data.Email,
+			PasswordHash:  "", // passwordless; use placeholder
+			DisplayName:   data.Email,
+			EmailVerified: true,
+		}
+		// CreateUser requires non-empty password for bcrypt
+		placeholder := "x" + uuid.New().String()
+		if err := h.Store.CreateUser(r.Context(), u, placeholder); err != nil {
+			sendJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+			return
+		}
+		audit.LogSignup(u.ID, data.Email, nil)
+	} else {
+		if !u.EmailVerified {
+			_ = h.Store.UpdateEmailVerified(r.Context(), u.ID, true)
+			u.EmailVerified = true
+		}
+	}
+
+	// Set session if SessionStore available
+	if h.SessionStore != nil {
+		if sessionID, err := h.SessionStore.Create(u.ID, u.Email); err == nil {
+			cookie := &http.Cookie{
+				Name:     sessionCookieName,
+				Value:    sessionID,
+				Path:     "/",
+				MaxAge:   sessionCookieMaxAge,
+				HttpOnly: true,
+				Secure:   strings.HasPrefix(h.issuerURL(), "https://"),
+				SameSite: http.SameSiteLaxMode,
+			}
+			http.SetCookie(w, cookie)
+		}
+	}
+
+	redirectURL, err := url.Parse(redirectURI)
+	if err != nil {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "Invalid redirect_uri"})
+		return
+	}
+
+	aud := data.Audience
+	if aud == "" && data.ClientID != "" {
+		aud = data.ClientID
+	}
+	if aud == "" {
+		aud = "https://api.example.com"
+	}
+
+	ruleUser := &rules.User{UserID: u.ID, Email: u.Email, EmailVerified: u.EmailVerified, Name: u.DisplayName, Nickname: u.DisplayName}
+	if h.RulesRunner != nil {
+		ruleUser, _ = h.RulesRunner.Run(ruleUser, &rules.Context{ClientID: data.ClientID, Connection: "email", Protocol: "oidc-basic-profile"})
+	}
+	emailVal, displayName := ruleUser.Email, ruleUser.Name
+	if displayName == "" {
+		displayName = ruleUser.Nickname
+	}
+	if displayName == "" {
+		displayName = emailVal
+	}
+
+	// response_type: code (auth code) or token/id_token (implicit)
+	respType := data.ResponseType
+	if respType == "" {
+		respType = "code"
+	}
+	if strings.Contains(respType, "token") || strings.Contains(respType, "id_token") {
+		var frag []string
+		if strings.Contains(respType, "token") {
+			accessTok, err := h.Issuer.Issue(u.ID, aud, data.ClientID, h.accessTokenLifetime(), ruleUser.AccessTokenClaims)
+			if err == nil {
+				frag = append(frag, "access_token="+url.QueryEscape(accessTok), "token_type=Bearer", "expires_in="+strconv.Itoa(h.accessTokenLifetime()))
+			}
+		}
+		if strings.Contains(respType, "id_token") {
+			opts := &token.IDTokenOptions{AMR: []string{"magiclink"}, CustomClaims: ruleUser.IDTokenClaims}
+			idTok, err := h.Issuer.IssueIDToken(u.ID, aud, data.ClientID, h.idTokenLifetime(), data.Scope, emailVal, displayName, "", opts)
+			if err == nil {
+				frag = append(frag, "id_token="+url.QueryEscape(idTok))
+			}
+		}
+		if state != "" {
+			frag = append(frag, "state="+url.QueryEscape(state))
+		}
+		dest := redirectURL.String()
+		if redirectURL.RawQuery != "" {
+			dest = strings.TrimSuffix(dest, "?"+redirectURL.RawQuery)
+		}
+		http.Redirect(w, r, dest+"#"+strings.Join(frag, "&"), http.StatusFound)
+		return
+	}
+
+	// Auth code flow
+	if h.GrantStore == nil {
+		sendJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error", "error_description": "Authorization code flow not configured"})
+		return
+	}
+	authCode := "ac_" + uuid.New().String()
+	sessionID := "sid_" + uuid.New().String()
+	h.GrantStore.SaveCode(authCode, &grants.AuthCode{
+		UserID:      u.ID,
+		ClientID:    data.ClientID,
+		RedirectURI: redirectURI,
+		Scope:       data.Scope,
+		Nonce:       "",
+		SessionID:   sessionID,
+		Audience:    aud,
+	})
+	q := redirectURL.Query()
+	q.Set("code", authCode)
+	if state != "" {
+		q.Set("state", state)
+	}
+	redirectURL.RawQuery = q.Encode()
+	audit.LogToken("magiclink", u.ID, data.ClientID, true, nil)
+	http.Redirect(w, r, redirectURL.String(), http.StatusFound)
+}
+
+func (h *Handlers) handlePasswordResetConfirm(w http.ResponseWriter, r *http.Request) {
+	var token, newPassword string
+	if strings.Contains(r.Header.Get("Content-Type"), "application/json") {
+		var req struct {
+			Token       string `json:"token"`
+			NewPassword string `json:"new_password"`
+		}
+		if json.NewDecoder(r.Body).Decode(&req) == nil {
+			token = req.Token
+			newPassword = req.NewPassword
+		}
+	} else {
+		_ = r.ParseForm()
+		token = r.FormValue("token")
+		newPassword = r.FormValue("new_password")
+	}
+	if token == "" || newPassword == "" {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "error_description": "token and new_password required"})
+		return
+	}
+	if err := password.Validate(newPassword); err != nil {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_password", "error_description": err.Error()})
+		return
+	}
+	if password.IsBreachedCheckEnabled() {
+		if err := password.IsBreached(newPassword); err != nil {
+			if err == password.ErrBreached {
+				sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_password", "error_description": "This password has been found in a data breach and cannot be used. Please choose a different password."})
+				return
+			}
+			sendJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "server_error", "error_description": "Unable to verify password. Please try again later."})
+			return
+		}
+	}
+	userID, ok := h.Store.ConsumePasswordResetToken(r.Context(), token)
+	if !ok {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant", "error_description": "Invalid or expired reset token"})
+		return
+	}
+	if err := h.Store.UpdatePassword(r.Context(), userID, newPassword); err != nil {
+		sendJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+		return
+	}
+	sendJSON(w, http.StatusOK, map[string]string{"message": "Password has been reset."})
 }
 
 func (h *Handlers) handleGetUser(w http.ResponseWriter, r *http.Request, path string) {
@@ -1159,7 +2229,7 @@ func userToAuth0Response(u *store.User) map[string]interface{} {
 	out := map[string]interface{}{
 		"user_id":        u.ID,
 		"email":          u.Email,
-		"email_verified": true,
+		"email_verified": u.EmailVerified,
 		"name":           u.DisplayName,
 		"nickname":       u.DisplayName,
 	}
@@ -1200,6 +2270,124 @@ func (h *Handlers) handleListUsers(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (h *Handlers) handleUsersExport(w http.ResponseWriter, r *http.Request) {
+	setRateLimitHeaders(w)
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	perPage, _ := strconv.Atoi(r.URL.Query().Get("per_page"))
+	if perPage <= 0 {
+		perPage = 100
+	}
+	if perPage > 100 {
+		perPage = 100
+	}
+
+	users, _, err := h.Store.ListUsersExport(r.Context(), page, perPage)
+	if err != nil {
+		sendJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+		return
+	}
+	sendJSON(w, http.StatusOK, users)
+}
+
+func (h *Handlers) handleUsersImport(w http.ResponseWriter, r *http.Request) {
+	setRateLimitHeaders(w)
+	var req []struct {
+		Email         string                 `json:"email"`
+		Password      string                 `json:"password"`
+		Name          string                 `json:"name"`
+		EmailVerified bool                   `json:"email_verified"`
+		UserMetadata  map[string]interface{} `json:"user_metadata"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_body", "message": "Invalid JSON array"})
+		return
+	}
+
+	var created int
+	var failed []map[string]interface{}
+	for i, u := range req {
+		if u.Email == "" {
+			failed = append(failed, map[string]interface{}{"index": i, "email": u.Email, "error": "email required"})
+			continue
+		}
+		pwd := u.Password
+		if pwd == "" {
+			pwd = "password123"
+		}
+		if err := password.Validate(pwd); err != nil {
+			failed = append(failed, map[string]interface{}{"index": i, "email": u.Email, "error": err.Error()})
+			continue
+		}
+		uid := "auth0|" + uuid.New().String()
+		displayName := u.Name
+		if displayName == "" {
+			displayName = u.Email
+			if idx := strings.Index(u.Email, "@"); idx > 0 {
+				displayName = u.Email[:idx]
+			}
+		}
+		user := &store.User{
+			ID:             uid,
+			Email:          u.Email,
+			DisplayName:    displayName,
+			EmailVerified:  u.EmailVerified,
+			OrganizationID: 1,
+			EnterpriseID:   1,
+			Role:           "user",
+			UserMetadata:   u.UserMetadata,
+		}
+		if err := h.Store.CreateUser(r.Context(), user, pwd); err != nil {
+			if strings.Contains(err.Error(), "UNIQUE") || strings.Contains(err.Error(), "duplicate") {
+				failed = append(failed, map[string]interface{}{"index": i, "email": u.Email, "error": "user already exists"})
+			} else {
+				failed = append(failed, map[string]interface{}{"index": i, "email": u.Email, "error": err.Error()})
+			}
+			continue
+		}
+		created++
+	}
+
+	sendJSON(w, http.StatusOK, map[string]interface{}{
+		"created": created,
+		"failed":  failed,
+	})
+}
+
+func (h *Handlers) handleUserGDPRExport(w http.ResponseWriter, r *http.Request, path string) {
+	userID := strings.TrimSuffix(strings.TrimPrefix(path, "/api/v2/users/"), "/export")
+	if userID == "" {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	setRateLimitHeaders(w)
+
+	u, err := h.Store.GetByID(r.Context(), userID)
+	if err != nil || u == nil {
+		sendJSON(w, http.StatusNotFound, map[string]string{"error": "Not found", "message": "The user does not exist."})
+		return
+	}
+
+	roles, _ := h.Store.GetUserRoles(r.Context(), userID)
+	blocked, _ := h.Store.IsUserBlocked(r.Context(), userID)
+
+	roleNames := make([]string, 0, len(roles))
+	for _, ro := range roles {
+		roleNames = append(roleNames, ro.Name)
+	}
+
+	out := map[string]interface{}{
+		"user_id":        u.ID,
+		"email":          u.Email,
+		"name":           u.DisplayName,
+		"email_verified":  u.EmailVerified,
+		"user_metadata":  u.UserMetadata,
+		"app_metadata":   u.AppMetadata,
+		"roles":          roleNames,
+		"blocked":        blocked,
+	}
+	sendJSON(w, http.StatusOK, out)
+}
+
 func (h *Handlers) handleCreateUserMgmt(w http.ResponseWriter, r *http.Request) {
 	setRateLimitHeaders(w)
 	var req struct {
@@ -1221,6 +2409,10 @@ func (h *Handlers) handleCreateUserMgmt(w http.ResponseWriter, r *http.Request) 
 	if req.Password == "" {
 		req.Password = "password123"
 	}
+	if err := password.Validate(req.Password); err != nil {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_password", "message": err.Error()})
+		return
+	}
 	uid := "auth0|" + uuid.New().String()
 	displayName := req.Name
 	if displayName == "" {
@@ -1229,10 +2421,12 @@ func (h *Handlers) handleCreateUserMgmt(w http.ResponseWriter, r *http.Request) 
 			displayName = req.Email[:i]
 		}
 	}
+	emailVerified := handlersEmailVerificationRequired() == false
 	u := &store.User{
 		ID:             uid,
 		Email:          req.Email,
 		DisplayName:    displayName,
+		EmailVerified:  emailVerified,
 		OrganizationID: 1,
 		EnterpriseID:   1,
 		Role:           "user",
@@ -1619,10 +2813,10 @@ func (h *Handlers) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sendJSON(w, http.StatusOK, map[string]interface{}{
-		"sub":            u.ID,
-		"email":          u.Email,
-		"email_verified":  true,
-		"name":           u.DisplayName,
+		"sub":             u.ID,
+		"email":           u.Email,
+		"email_verified":  u.EmailVerified,
+		"name":            u.DisplayName,
 	})
 }
 
@@ -1674,7 +2868,7 @@ func (h *Handlers) handleTokeninfo(w http.ResponseWriter, r *http.Request) {
 		"user_id":        u.ID,
 		"sub":            u.ID,
 		"email":          u.Email,
-		"email_verified": true,
+		"email_verified": u.EmailVerified,
 		"name":           u.DisplayName,
 	}
 	for k, v := range claims {
@@ -1704,6 +2898,10 @@ func sendJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)
+}
+
+func handlersEmailVerificationRequired() bool {
+	return os.Getenv("EMAIL_VERIFICATION_REQUIRED") != "false"
 }
 
 func toInt(v interface{}) (int, bool) {
@@ -1775,6 +2973,188 @@ func (h *Handlers) handleLoginCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Error(w, "redirect_uri and client_id required", http.StatusBadRequest)
+}
+
+func (h *Handlers) handleSocialCallback(w http.ResponseWriter, r *http.Request) {
+	state := r.URL.Query().Get("state")
+	code := r.URL.Query().Get("code")
+	connection := r.URL.Query().Get("connection")
+	if state == "" || code == "" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`<!DOCTYPE html><html><body><p>state and code are required.</p></body></html>`))
+		return
+	}
+	if h.GrantStore == nil {
+		http.Error(w, "Social login not configured", http.StatusInternalServerError)
+		return
+	}
+	ss, ok := h.GrantStore.ConsumeSocialState(state)
+	if !ok || ss == nil {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`<!DOCTYPE html><html><body><p>Invalid or expired state. Please try again.</p></body></html>`))
+		return
+	}
+	// Use connection from state if not in query (provider may not echo it)
+	if connection == "" {
+		connection = ss.Connection
+	}
+	prov := social.GetProvider(connection)
+	if prov == nil {
+		redirectWithError(w, r, ss.RedirectURI, ss.State, "invalid_connection", "Unknown connection")
+		return
+	}
+	callbackURL := strings.TrimSuffix(h.issuerURL(), "/") + "/callback/social"
+	userInfo, err := prov.ExchangeCode(r.Context(), code, callbackURL)
+	if err != nil {
+		redirectWithError(w, r, ss.RedirectURI, ss.State, "server_error", "Failed to exchange code")
+		return
+	}
+	if userInfo.Email == "" {
+		redirectWithError(w, r, ss.RedirectURI, ss.State, "server_error", "Provider did not return email")
+		return
+	}
+	// Resolve to local user: by provider identity, then by email
+	u, err := h.Store.GetUserByProviderIdentity(r.Context(), connection, userInfo.Sub)
+	if err != nil {
+		redirectWithError(w, r, ss.RedirectURI, ss.State, "server_error", "Database error")
+		return
+	}
+	if u == nil {
+		u, err = h.Store.GetByEmail(r.Context(), userInfo.Email)
+		if err != nil {
+			redirectWithError(w, r, ss.RedirectURI, ss.State, "server_error", "Database error")
+			return
+		}
+		if u != nil {
+			_ = h.Store.LinkUserIdentity(r.Context(), u.ID, connection, userInfo.Sub)
+		}
+	}
+	if u == nil {
+		// Create new user (email_verified=true from social)
+		uid := "auth0|" + uuid.New().String()
+		displayName := userInfo.Name
+		if displayName == "" {
+			displayName = userInfo.Email
+			if i := strings.Index(userInfo.Email, "@"); i > 0 {
+				displayName = userInfo.Email[:i]
+			}
+		}
+		// Random password - social users don't use it
+		socialPass := "soc_" + uuid.New().String() + uuid.New().String()[:8]
+		u = &store.User{
+			ID:             uid,
+			Email:          userInfo.Email,
+			DisplayName:    displayName,
+			EmailVerified:  true,
+			OrganizationID:  1,
+			EnterpriseID:   1,
+			Role:           "user",
+			AppMetadata:    map[string]interface{}{"providers": []map[string]string{{"provider": connection, "user_id": userInfo.Sub}}},
+		}
+		if err := h.Store.CreateUser(r.Context(), u, socialPass); err != nil {
+			redirectWithError(w, r, ss.RedirectURI, ss.State, "server_error", "Failed to create user")
+			return
+		}
+		_ = h.Store.LinkUserIdentity(r.Context(), u.ID, connection, userInfo.Sub)
+	}
+	// Set session
+	if h.SessionStore != nil {
+		if sid, err := h.SessionStore.Create(u.ID, u.Email); err == nil {
+			http.SetCookie(w, &http.Cookie{
+				Name:     sessionCookieName,
+				Value:    sid,
+				Path:     "/",
+				MaxAge:   sessionCookieMaxAge,
+				HttpOnly: true,
+				SameSite: http.SameSiteLaxMode,
+			})
+		}
+	}
+	// Redirect to original redirect_uri with code (auth code flow) or token (implicit)
+	redirectURL, _ := url.Parse(ss.RedirectURI)
+	if ss.ResponseType == "token" || strings.Contains(ss.ResponseType, "token") || strings.Contains(ss.ResponseType, "id_token") {
+		// Implicit flow
+		aud := ss.Audience
+		if aud == "" {
+			aud = ss.ClientID
+		}
+		if aud == "" {
+			aud = "https://api.example.com"
+		}
+		ruleUser := &rules.User{UserID: u.ID, Email: u.Email, EmailVerified: u.EmailVerified, Name: u.DisplayName, Nickname: u.DisplayName}
+		if h.RulesRunner != nil {
+			ruleUser, _ = h.RulesRunner.Run(ruleUser, &rules.Context{ClientID: ss.ClientID, Connection: connection, Protocol: "oidc-basic-profile"})
+		}
+		email, displayName := ruleUser.Email, ruleUser.Name
+		if displayName == "" {
+			displayName = ruleUser.Nickname
+		}
+		if displayName == "" {
+			displayName = email
+		}
+		var frag []string
+		if strings.Contains(ss.ResponseType, "token") {
+			accessTok, err := h.Issuer.Issue(u.ID, aud, ss.ClientID, h.accessTokenLifetime(), ruleUser.AccessTokenClaims)
+			if err == nil {
+				frag = append(frag, "access_token="+url.QueryEscape(accessTok), "token_type=Bearer", "expires_in="+strconv.Itoa(h.accessTokenLifetime()))
+			}
+		}
+		if strings.Contains(ss.ResponseType, "id_token") {
+			opts := &token.IDTokenOptions{AMR: []string{"oidc"}, CustomClaims: ruleUser.IDTokenClaims}
+			idTok, err := h.Issuer.IssueIDToken(u.ID, aud, ss.ClientID, h.idTokenLifetime(), ss.Scope, email, displayName, "", opts)
+			if err == nil {
+				frag = append(frag, "id_token="+url.QueryEscape(idTok))
+			}
+		}
+		if ss.State != "" {
+			frag = append(frag, "state="+url.QueryEscape(ss.State))
+		}
+		dest := redirectURL.String()
+		if redirectURL.RawQuery != "" {
+			dest = strings.TrimSuffix(dest, "?"+redirectURL.RawQuery)
+		}
+		http.Redirect(w, r, dest+"#"+strings.Join(frag, "&"), http.StatusFound)
+		return
+	}
+	// Auth code flow
+	authCode := "ac_" + uuid.New().String()
+	sessionID := "sid_" + uuid.New().String()
+	h.GrantStore.SaveCode(authCode, &grants.AuthCode{
+		UserID:              u.ID,
+		ClientID:            ss.ClientID,
+		RedirectURI:         ss.RedirectURI,
+		Scope:               ss.Scope,
+		Nonce:               ss.Nonce,
+		SessionID:           sessionID,
+		Audience:            ss.Audience,
+		CodeChallenge:       ss.CodeChallenge,
+		CodeChallengeMethod: ss.CodeChallengeMethod,
+	})
+	q := redirectURL.Query()
+	q.Set("code", authCode)
+	if ss.State != "" {
+		q.Set("state", ss.State)
+	}
+	redirectURL.RawQuery = q.Encode()
+	http.Redirect(w, r, redirectURL.String(), http.StatusFound)
+}
+
+func redirectWithError(w http.ResponseWriter, r *http.Request, redirectURI, state, errCode, errDesc string) {
+	dest, err := url.Parse(redirectURI)
+	if err != nil {
+		http.Error(w, errDesc, http.StatusInternalServerError)
+		return
+	}
+	q := dest.Query()
+	q.Set("error", errCode)
+	q.Set("error_description", errDesc)
+	if state != "" {
+		q.Set("state", state)
+	}
+	dest.RawQuery = q.Encode()
+	http.Redirect(w, r, dest.String(), http.StatusFound)
 }
 
 func extractUserIDFromPath(path, suffix string) string {

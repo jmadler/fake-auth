@@ -1,0 +1,64 @@
+# auth2 Cloud Run service
+# Deploy with: gcloud run services replace deploy/cloud-run/service.yaml
+# Or use cloudbuild.yaml for CI/CD
+
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: auth2
+  labels:
+    app: auth2
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "10"
+    spec:
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      containers:
+        - image: gcr.io/PROJECT_ID/auth2:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            # For Postgres (when implemented): use DB_DSN from Secret Manager
+            # - name: DB_DSN
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: auth2-db-dsn
+            #       key: latest
+            # For Redis (when implemented): use REDIS_URL from Secret Manager
+            # - name: REDIS_URL
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: auth2-redis-url
+            #       key: latest
+            # ISSUER_URL: Your public auth URL (set to your Cloud Run URL)
+            - name: ISSUER_URL
+              value: "https://auth2.example.com"
+            # SQLite (current): ephemeral, data lost on scale-to-zero
+            - name: DB_PATH
+              value: "/data/auth0.db"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+  traffic:
+    - percent: 100
+      latestRevision: true

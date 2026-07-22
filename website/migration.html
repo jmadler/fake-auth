@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Switch from Auth0 to auth2 — Migration Guide | Auth0 Alternative</title>
+  <meta name="description" content="How to migrate from Auth0 to auth2. Step-by-step guide to switch your OAuth, OIDC, and Management API from Auth0. Half the cost, same compatibility.">
+  <meta name="keywords" content="Auth0 migration, switch from Auth0, Auth0 to auth2, leave Auth0, Auth0 alternative migration">
+  <link rel="canonical" href="https://auth2.dev/migration">
+  <link rel="stylesheet" href="style.css">
+  <style>
+    :root { --bg:#0a0e14; --fg:#e6e6e6; --accent:#00d9a5; --muted:#6b7280; --card:#141922; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--fg); line-height: 1.7; min-height: 100vh; }
+    .container { max-width: 720px; margin: 0 auto; padding: 2rem 1.5rem; }
+    header { padding: 1.5rem 0; border-bottom: 1px solid rgba(255,255,255,.06); }
+    .logo { font-size: 1.25rem; font-weight: 700; color: var(--accent); }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    h1 { font-size: 1.75rem; margin: 2rem 0 1rem; }
+    h2 { font-size: 1.25rem; margin: 2rem 0 .75rem; color: var(--accent); }
+    p { margin-bottom: 1rem; color: var(--muted); }
+    code { background: var(--card); padding: .15em .4em; border-radius: 4px; font-size: .9em; }
+    pre { background: var(--card); padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1rem 0; font-size: .85rem; }
+    ol, ul { margin: 1rem 0; padding-left: 1.5rem; color: var(--muted); }
+    li { margin-bottom: .5rem; }
+    .back { display: inline-block; margin-bottom: 1rem; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="container">
+      <a href="index.html" class="logo">auth2</a>
+      <a href="index.html" class="back" style="float:right;">← Home</a>
+    </div>
+  </header>
+
+  <main class="container">
+    <h1>Switch from Auth0 to auth2</h1>
+    <p>Migrating from Auth0 is straightforward. auth2 uses the same OAuth 2.0 / OIDC endpoints and Auth0-style Management API, so most of your code stays the same.</p>
+
+    <h2>1. Deploy auth2</h2>
+    <p>Run auth2 on GCP Cloud Run, AWS ECS, or Docker. See <a href="https://github.com/jmadler/auth2/blob/main/DEPLOY.md">DEPLOY.md</a> for details.</p>
+    <pre># Quick start with Docker Compose (Postgres + Redis)
+docker compose -f deploy/docker-compose.yml up -d</pre>
+
+    <h2>2. Configure issuer URL</h2>
+    <p>Point <code>ISSUER_URL</code> to your auth2 instance (e.g. <code>https://auth.yourdomain.com</code>). This is the base URL for OIDC discovery, JWKS, and tokens.</p>
+
+    <h2>3. Match application settings</h2>
+    <p>In auth2, register your applications (clients) via <code>CLIENT_REGISTRY</code> env or Management API. Use the same <code>client_id</code>, <code>redirect_uri</code>, and <code>allowed_scopes</code> as in Auth0.</p>
+
+    <h2>4. Export users from Auth0</h2>
+    <p>Use Auth0's User Import/Export extension or Management API to export users. Auth0 stores passwords hashed — you'll need to use the <a href="https://auth0.com/docs/manage-users/user-migration">Migration Guide</a> for password migration, or trigger password reset on first login.</p>
+
+    <h2>5. Import users into auth2</h2>
+    <p>Use auth2's Management API to create users:</p>
+    <pre>POST /api/v2/users
+Content-Type: application/json
+Authorization: Bearer YOUR_ADMIN_API_KEY
+
+{
+  "connection": "Username-Password-Authentication",
+  "email": "user@example.com",
+  "password": "SecurePassword123",
+  "name": "User Name"
+}</pre>
+
+    <h2>6. Update your application</h2>
+    <p>Change the auth configuration in your app from Auth0's domain to your auth2 issuer URL. Example for a typical SPA:</p>
+    <pre>// Before (Auth0)
+domain: 'your-tenant.auth0.com'
+
+// After (auth2)
+domain: 'auth.yourdomain.com'
+// or issuer: 'https://auth.yourdomain.com/'</pre>
+
+    <h2>7. Rules and custom logic</h2>
+    <p>auth2 supports Auth0-style Rules (JavaScript). Place your <code>.js</code> files in <code>RULES_DIR</code>. Rules receive <code>user</code> and <code>context</code> and can add claims to tokens.</p>
+
+    <h2>8. Social login</h2>
+    <p>Auth0 supports Google, GitHub, etc. auth2 does not yet include social connectors. Options:</p>
+    <ul>
+      <li>Use database connection only (email/password) during migration</li>
+      <li>Implement social as a custom OAuth proxy (on roadmap)</li>
+    </ul>
+
+    <h2>What stays the same</h2>
+    <ul>
+      <li><code>/authorize</code>, <code>/oauth/token</code>, <code>/oauth/revoke</code></li>
+      <li><code>/.well-known/openid-configuration</code>, <code>/.well-known/jwks.json</code></li>
+      <li><code>/userinfo</code>, <code>/tokeninfo</code></li>
+      <li><code>/api/v2/users</code>, <code>/api/v2/clients</code>, <code>/api/v2/roles</code></li>
+    </ul>
+
+    <p style="margin-top:2rem;"><a href="index.html">← Back to auth2</a></p>
+  </main>
+</body>
+</html>

@@ -1,0 +1,27 @@
+{
+  "name": "auth2-e2e-helpers",
+  "version": "1.0.0",
+  "description": "E2E test helpers for auth2 (Auth0-compatible) login flows with Cypress and Playwright",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "require": "./index.js",
+      "import": "./index.js",
+      "types": "./index.d.ts"
+    }
+  },
+  "keywords": ["auth2", "auth0", "e2e", "cypress", "playwright", "testing"],
+  "license": "MIT",
+  "scripts": {
+    "test": "node utils.test.js"
+  },
+  "peerDependencies": {
+    "cypress": ">=10.0.0",
+    "playwright": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "cypress": { "optional": true },
+    "playwright": { "optional": true }
+  }
+}

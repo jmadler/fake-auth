@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Audit Logs — auth2 Admin</title>
+  <link rel="stylesheet" href="/admin/style.css">
+</head>
+<body class="admin">
+  <nav class="admin-nav">
+    <a href="/admin/">Dashboard</a>
+    <a href="/admin/users.html">Users</a>
+    <a href="/admin/clients.html">Clients</a>
+    <a href="/admin/roles.html">Roles</a>
+    <a href="/admin/logs.html">Logs</a>
+    <a href="/admin/logout" class="logout">Log out</a>
+  </nav>
+  <main>
+    <h1>Audit Logs</h1>
+    <div id="loading">Loading...</div>
+    <div id="error" class="error" hidden></div>
+    <div id="content" hidden>
+      <table class="data-table">
+        <thead>
+          <tr><th>ID</th><th>Type</th><th>User</th><th>Client</th><th>Details</th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </main>
+  <script src="/admin/app.js"></script>
+  <script>
+    (function() {
+      function getAuth() { return { headers: adminAuth(); }; }
+      document.getElementById('loading').hidden = false;
+      fetch('/api/v2/logs?per_page=50', getAuth())
+        .then(r => { if (!r.ok) throw new Error(r.statusText); return r.json(); })
+        .then(data => {
+          const logs = Array.isArray(data) ? data : (data.logs || []);
+          const tbody = document.getElementById('rows');
+          tbody.innerHTML = logs.map(l => {
+            const id = escapeHtml(String(l.log_id ?? l.id ?? ''));
+            const type = escapeHtml(l.type || l.event_type || '');
+            const userId = escapeHtml(l.user_id || '');
+            const clientId = escapeHtml(l.client_id || '');
+            let details = l.date || l.payload || '';
+            if (typeof details === 'string' && details.startsWith('{')) {
+              try { details = JSON.stringify(JSON.parse(details), null, 0).slice(0, 120) + '...'; } catch (_) {}
+            }
+            details = escapeHtml(String(details));
+            return `<tr><td>${id}</td><td>${type}</td><td>${userId}</td><td>${clientId}</td><td class="mono">${details}</td></tr>`;
+          }).join('');
+          document.getElementById('loading').hidden = true;
+          document.getElementById('content').hidden = false;
+        })
+        .catch(e => {
+          document.getElementById('loading').hidden = true;
+          document.getElementById('error').textContent = e.message || 'Failed to load logs';
+          document.getElementById('error').hidden = false;
+        });
+    })();
+  </script>
+</body>
+</html>

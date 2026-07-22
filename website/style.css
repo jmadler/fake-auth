@@ -1,0 +1,8 @@
+/* Shared styles for auth2 website */
+:root {
+  --bg: #0a0e14;
+  --fg: #e6e6e6;
+  --accent: #00d9a5;
+  --muted: #6b7280;
+  --card: #141922;
+}

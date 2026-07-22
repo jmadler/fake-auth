@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Users — auth2 Admin</title>
+  <link rel="stylesheet" href="/admin/style.css">
+</head>
+<body class="admin">
+  <nav class="admin-nav">
+    <a href="/admin/">Dashboard</a>
+    <a href="/admin/users.html">Users</a>
+    <a href="/admin/clients.html">Clients</a>
+    <a href="/admin/roles.html">Roles</a>
+    <a href="/admin/logs.html">Logs</a>
+    <a href="/admin/logout" class="logout">Log out</a>
+  </nav>
+  <main>
+    <h1>Users</h1>
+    <div id="loading">Loading...</div>
+    <div id="error" class="error" hidden></div>
+    <div id="content" hidden>
+      <div class="pagination">
+        <button id="prev" disabled>Previous</button>
+        <span id="pageInfo"></span>
+        <button id="next">Next</button>
+      </div>
+      <table class="data-table">
+        <thead>
+          <tr><th>User ID</th><th>Email</th><th>Name</th><th>Verified</th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </main>
+  <script src="/admin/app.js"></script>
+  <script>
+    (function() {
+      const perPage = 25;
+      let page = 0;
+      let total = 0;
+      function getAuth() { return { headers: adminAuth() }; }
+      function render() {
+        document.getElementById('loading').hidden = false;
+        document.getElementById('error').hidden = true;
+        document.getElementById('content').hidden = true;
+        fetch('/api/v2/users?page=' + page + '&per_page=' + perPage + '&include_totals=true', getAuth())
+          .then(r => { if (!r.ok) throw new Error(r.statusText); return r.json(); })
+          .then(data => {
+            total = data.total;
+            const users = data.users || [];
+            const tbody = document.getElementById('rows');
+            tbody.innerHTML = users.map(u => {
+              const id = escapeHtml(u.user_id || u._id || '');
+              const email = escapeHtml(u.email || '');
+              const name = escapeHtml(u.name || u.nickname || '');
+              const verified = u.email_verified ? '✓' : '';
+              return `<tr><td>${id}</td><td>${email}</td><td>${name}</td><td>${verified}</td></tr>`;
+            }).join('');
+            document.getElementById('loading').hidden = true;
+            document.getElementById('content').hidden = false;
+            document.getElementById('pageInfo').textContent = (page * perPage + 1) + '–' + Math.min((page + 1) * perPage, total) + ' of ' + total;
+            document.getElementById('prev').disabled = page === 0;
+            document.getElementById('next').disabled = (page + 1) * perPage >= total;
+          })
+          .catch(e => {
+            document.getElementById('loading').hidden = true;
+            document.getElementById('error').textContent = e.message || 'Failed to load users';
+            document.getElementById('error').hidden = false;
+          });
+      }
+      document.getElementById('prev').onclick = () => { page--; render(); };
+      document.getElementById('next').onclick = () => { page++; render(); };
+      render();
+    })();
+  </script>
+</body>
+</html>

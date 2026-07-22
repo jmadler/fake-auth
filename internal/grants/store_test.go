@@ -117,3 +117,88 @@ func TestDeviceCodeNotAuthorized(t *testing.T) {
 		t.Fatal("ConsumeDeviceCode should fail when device code not authorized")
 	}
 }
+
+func TestRevokeRefreshToken(t *testing.T) {
+	s := NewStore(1*time.Minute, 24*time.Hour)
+	rg := &RefreshGrant{UserID: "user|1", ClientID: "client", Scope: "openid"}
+	s.SaveRefreshToken("rt_revoke", rg)
+
+	ok := s.RevokeRefreshToken("rt_revoke")
+	if !ok {
+		t.Fatal("RevokeRefreshToken should return true when token exists")
+	}
+	_, consumed := s.ConsumeRefreshToken("rt_revoke")
+	if consumed {
+		t.Fatal("revoked token should not be consumable")
+	}
+	ok = s.RevokeRefreshToken("rt_nonexistent")
+	if ok {
+		t.Error("RevokeRefreshToken should return false for nonexistent")
+	}
+}
+
+func TestSocialState(t *testing.T) {
+	s := NewStore(1*time.Minute, 24*time.Hour)
+	ss := &SocialState{
+		RedirectURI: "http://localhost/cb",
+		ClientID:    "c1",
+		State:       "xyz",
+	}
+	s.SaveSocialState("state_abc", ss)
+
+	got, ok := s.ConsumeSocialState("state_abc")
+	if !ok {
+		t.Fatal("ConsumeSocialState should succeed")
+	}
+	if got.ClientID != "c1" {
+		t.Errorf("ClientID = %q", got.ClientID)
+	}
+	_, ok = s.ConsumeSocialState("state_abc")
+	if ok {
+		t.Fatal("state should be consumed (one-time)")
+	}
+}
+
+func TestMFAPending(t *testing.T) {
+	s := NewStore(1*time.Minute, 24*time.Hour)
+	p := &MFAPending{UserID: "user|1", ClientID: "c1"}
+	s.SaveMFAPending("ch_123", p)
+
+	got, ok := s.ConsumeMFAPending("ch_123")
+	if !ok {
+		t.Fatal("ConsumeMFAPending should succeed")
+	}
+	if got.UserID != "user|1" {
+		t.Errorf("UserID = %q", got.UserID)
+	}
+	_, ok = s.ConsumeMFAPending("ch_123")
+	if ok {
+		t.Fatal("MFA pending should be consumed")
+	}
+}
+
+func TestWebAuthnSession(t *testing.T) {
+	s := NewStore(1*time.Minute, 24*time.Hour)
+	data := []byte(`{"challenge":"abc"}`)
+	s.SaveWebAuthnSession("sid_wa1", data)
+
+	got, ok := s.GetWebAuthnSession("sid_wa1")
+	if !ok {
+		t.Fatal("GetWebAuthnSession should succeed")
+	}
+	if string(got) != string(data) {
+		t.Errorf("data mismatch")
+	}
+
+	got2, ok := s.ConsumeWebAuthnSession("sid_wa1")
+	if !ok {
+		t.Fatal("ConsumeWebAuthnSession should succeed")
+	}
+	if string(got2) != string(data) {
+		t.Errorf("data mismatch")
+	}
+	_, ok = s.GetWebAuthnSession("sid_wa1")
+	if ok {
+		t.Fatal("session should be consumed")
+	}
+}

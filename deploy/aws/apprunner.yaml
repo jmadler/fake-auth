@@ -1,0 +1,11 @@
+# AWS App Runner service config
+# Deploy: aws apprunner create-service --cli-input-json file://apprunner-input.json
+# Or use App Runner console with "Source: Container registry" -> ECR image
+
+version: 1.0
+runtime: ""
+
+# App Runner pulls from ECR. Build and push first:
+#   docker build -t ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/auth2:latest .
+#   aws ecr get-login-password | docker login --username AWS --password-stdin ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com
+#   docker push ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/auth2:latest

@@ -59,3 +59,18 @@ func TestRevoke(t *testing.T) {
 		t.Fatalf("Get should return nil after Revoke, got ok=%v sess=%v", ok, sess)
 	}
 }
+
+func TestCount(t *testing.T) {
+	store := NewStore(24 * time.Hour)
+	if store.Count() != 0 {
+		t.Errorf("Count = %d, want 0", store.Count())
+	}
+	sid, _ := store.Create("user|1", "u@example.com")
+	if store.Count() != 1 {
+		t.Errorf("Count = %d, want 1", store.Count())
+	}
+	store.Revoke(sid)
+	if store.Count() != 0 {
+		t.Errorf("Count after Revoke = %d", store.Count())
+	}
+}
